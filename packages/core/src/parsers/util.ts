@@ -18,6 +18,45 @@ function parseLine(line: string): { ok: true; value: unknown } | { ok: false } {
   }
 }
 
+function decodeZst(buf: Buffer): string {
+  const z = zlib as unknown as { zstdDecompressSync?: (b: Buffer) => Buffer };
+  if (typeof z.zstdDecompressSync !== 'function') {
+    throw new Error('zstd decompression requires Node >= 22.15');
+  }
+  return z.zstdDecompressSync(buf).toString('utf8');
+}
+
+/**
+ * Parse every JSON value in a JSONL file, reading it in one go. Same skipping rules and `.zst`
+ * support as readJsonlLines, but parses synchronously instead of awaiting each line: far fewer
+ * promises, which matters when a host (e.g. React's dev-mode async tracking) instruments every
+ * promise created while it runs.
+ */
+export async function readJsonlFile(file: string): Promise<unknown[]> {
+  let text: string;
+  if (file.toLowerCase().endsWith('.zst')) {
+    try {
+      text = decodeZst(await readFile(file));
+    } catch (err) {
+      // A truncated .zst of a live session may fail to decompress; surface as no lines.
+      if ((err as Error).message?.includes('Node >=')) throw err;
+      return [];
+    }
+  } else {
+    text = await readFile(file, 'utf8');
+  }
+  const out: unknown[] = [];
+  let start = 0;
+  while (start < text.length) {
+    let nl = text.indexOf('\n', start);
+    if (nl === -1) nl = text.length;
+    const r = parseLine(text.slice(start, nl));
+    if (r.ok) out.push(r.value);
+    start = nl + 1;
+  }
+  return out;
+}
+
 /**
  * Iterate parsed JSON values from a JSONL file. Blank, partial or invalid lines are skipped
  * silently (live files may end in a half-written line). Supports `.zst` compressed files via
@@ -27,12 +66,7 @@ export async function* readJsonlLines(file: string): AsyncIterable<unknown> {
   if (file.toLowerCase().endsWith('.zst')) {
     let text: string;
     try {
-      const buf = await readFile(file);
-      const z = zlib as unknown as { zstdDecompressSync?: (b: Buffer) => Buffer };
-      if (typeof z.zstdDecompressSync !== 'function') {
-        throw new Error('zstd decompression requires Node >= 22.15');
-      }
-      text = z.zstdDecompressSync(buf).toString('utf8');
+      text = decodeZst(await readFile(file));
     } catch (err) {
       // A truncated .zst of a live session may fail to decompress; surface as no lines.
       if ((err as Error).message?.includes('Node >=')) throw err;

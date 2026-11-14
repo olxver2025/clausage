@@ -108,6 +108,18 @@ async function load(opts: LoadUsageOptions): Promise<UsageData> {
     untilMs: opts.until,
   };
   pricingTables.set(data, pricing);
+  return hideBulk(data);
+}
+
+/**
+ * Make the large arrays non-enumerable. Reads are unchanged, but React's dev-mode debug info
+ * (which serializes the value of every promise a Server Component awaits) skips them instead of
+ * shipping every event to the renderer, which took tens of seconds per page.
+ */
+function hideBulk(data: UsageData): UsageData {
+  for (const key of ["events", "sessions", "historical"] as const) {
+    Object.defineProperty(data, key, { value: data[key], enumerable: false, writable: true, configurable: true });
+  }
   return data;
 }
 

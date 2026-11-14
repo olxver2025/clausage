@@ -36,7 +36,7 @@ import {
   exists,
   homeDir,
   normalizePath,
-  readJsonlLines,
+  readJsonlFile,
   toEpochMs,
   walkFiles,
 } from './util.js';
@@ -489,10 +489,82 @@ function fileIdOf(file: string): string | undefined {
   return UUID_RE.exec(path.basename(file))?.[1]?.toLowerCase();
 }
 
-async function readLines(file: string): Promise<unknown[]> {
-  const out: unknown[] = [];
-  for await (const v of readJsonlLines(file)) out.push(v);
+/**
+ * Drop the bulky text (messages, reasoning, tool output, compaction history, instructions) from
+ * a rollout line, keeping only the fields parseCodexRolloutLines and readCodexRateLimits read.
+ */
+function slimLine(v: unknown): unknown {
+  if (!isObj(v) || !isObj(v.payload)) return v;
+  const p = v.payload;
+  let payload: Obj | undefined;
+  switch (v.type) {
+    case 'response_item':
+      payload = { type: p.type, role: p.role, call_id: p.call_id, id: p.id };
+      break;
+    case 'turn_context':
+      payload = {
+        turn_id: p.turn_id,
+        model: p.model,
+        cwd: p.cwd,
+        collaboration_mode:
+          isObj(p.collaboration_mode) && isObj(p.collaboration_mode.settings)
+            ? { settings: { model: p.collaboration_mode.settings.model } }
+            : undefined,
+      };
+      break;
+    case 'world_state':
+      payload = { state: isObj(p.state) ? { model: p.state.model } : undefined };
+      break;
+    case 'compacted': {
+      const rm = p.resume_metadata;
+      const prev = isObj(rm) && isObj(rm.previous_turn_settings) ? rm.previous_turn_settings : undefined;
+      payload = {
+        compaction_response_id: p.compaction_response_id,
+        latest_token_usage_record: p.latest_token_usage_record,
+        resume_metadata: prev ? { previous_turn_settings: { model: prev.model } } : undefined,
+      };
+      break;
+    }
+    case 'session_meta': {
+      const { base_instructions: _b, instructions: _i, ...rest } = p;
+      payload = rest;
+      break;
+    }
+    case 'event_msg':
+      if (p.type === 'item_completed') {
+        payload = { type: p.type, item: isObj(p.item) ? { type: p.item.type } : undefined };
+      } else if (p.type === 'user_message' || p.type === 'agent_message') {
+        payload = { type: p.type };
+      }
+      break;
+  }
+  if (!payload) return v;
+  const out: Obj = { type: v.type, payload };
+  if ('timestamp' in v) out.timestamp = v.timestamp;
+  if ('ordinal' in v) out.ordinal = v.ordinal;
   return out;
+}
+
+// Parsed (slimmed) lines per rollout file, reused while the file's size and mtime are unchanged.
+// Most rollouts are immutable once a session ends, so repeat loads only re-parse live files.
+const lineCache = new Map<string, { size: number; mtimeMs: number; lines: Promise<unknown[]> }>();
+
+async function readLines(file: string): Promise<unknown[]> {
+  const st = await stat(file);
+  const hit = lineCache.get(file);
+  if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.lines;
+  const lines = readJsonlFile(file).then((values) => values.map(slimLine));
+  lineCache.set(file, { size: st.size, mtimeMs: st.mtimeMs, lines });
+  lines.catch(() => {
+    if (lineCache.get(file)?.lines === lines) lineCache.delete(file);
+  });
+  return lines;
+}
+
+/** Forget cached lines for files under `root` that are no longer there. */
+function pruneLineCache(root: string, live: ReadonlySet<string>): void {
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  for (const f of lineCache.keys()) if (f.startsWith(prefix) && !live.has(f)) lineCache.delete(f);
 }
 
 /** Read titles / cwd / model from `state_*.sqlite` threads (read-only) and session_index.jsonl. */
@@ -505,7 +577,7 @@ export async function readCodexThreadMeta(
   const idx = path.join(root, 'session_index.jsonl');
   if (await exists(idx)) {
     try {
-      for await (const v of readJsonlLines(idx)) {
+      for (const v of await readJsonlFile(idx)) {
         if (!isObj(v)) continue;
         const id = str(v.id);
         const name = str(v.thread_name);
@@ -575,6 +647,7 @@ async function load(opts: LoadOptions): Promise<ParseResult> {
   for (const root of roots) {
     if (!(await exists(root))) continue;
     const files = await collectRollouts(root);
+    pruneLineCache(root, new Set(files));
     if (files.length === 0 && !(await exists(path.join(root, 'sessions')))) continue;
     result.sources.push(normalizePath(root));
     const tm = await readCodexThreadMeta(root, opts.warn);
@@ -692,7 +765,7 @@ export async function readCodexRateLimits(
   for (const { f } of files.slice(0, opts.maxFiles ?? 8)) {
     let sid: string | undefined;
     try {
-      for await (const v of readJsonlLines(f)) {
+      for (const v of await readLines(f)) {
         if (!isObj(v)) continue;
         const p = isObj(v.payload) ? v.payload : null;
         if (!p) continue;

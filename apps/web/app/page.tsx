@@ -61,19 +61,22 @@ async function Overview({ searchParams }: { searchParams: PageProps<"/">["search
     return (
       <div className="flex flex-col gap-3">
         {todayStrip}
-        <EmptyState filters={filters} data={data} />
+        <EmptyState filters={filters} sourceCount={Object.values(data.sources).reduce((n, list) => n + list.length, 0)} />
       </div>
     );
   }
 
-  const stats = periodStats(data, filters);
-  const prevStats = prev ? periodStats(prev, prevFilters!) : undefined;
+  // Child components get small, precomputed props only: in dev, React serializes every server
+  // component's props as debug info, and passing the raw usage data (every event) made this page
+  // take tens of seconds to render.
+  const { daily: dailyReport, sessionReport, ...stats } = periodStats(data, filters);
+  const prevStats = prev ? totalsOf(periodStats(prev, prevFilters!)) : undefined;
   const days = rangeDays(filters, now);
   const until = filters.until ?? today;
 
-  const dailyCost = fillDailyGaps(series(stats.daily, "costUSD", "daily"), filters.since, until, (k) => formatBucketKey(k, "daily"));
-  const dailyTokens = fillDailyGaps(series(stats.daily, "totalTokens", "daily"), filters.since, until, (k) => formatBucketKey(k, "daily"));
-  const ts = filters.group === "daily" ? stats.daily : reportFrom(data, filters.group, filters);
+  const dailyCost = fillDailyGaps(series(dailyReport, "costUSD", "daily"), filters.since, until, (k) => formatBucketKey(k, "daily"));
+  const dailyTokens = fillDailyGaps(series(dailyReport, "totalTokens", "daily"), filters.since, until, (k) => formatBucketKey(k, "daily"));
+  const ts = filters.group === "daily" ? dailyReport : reportFrom(data, filters.group, filters);
   const chartCost = filters.group === "daily" ? dailyCost : series(ts, "costUSD", filters.group);
   const chartTokens = filters.group === "daily" ? dailyTokens : series(ts, "totalTokens", filters.group);
   const estimatedPeriods = ts.rows.filter((r) => r.meta?.historical).length;
@@ -90,13 +93,13 @@ async function Overview({ searchParams }: { searchParams: PageProps<"/">["search
       <Panel title="Usage over time" description={`Stacked by tool · ${formatCost(ts.totals.costUSD)} · ${formatTokens(ts.totals.totalTokens)} tokens`}>
         <UsageChart cost={chartCost} tokens={chartTokens} unit={UNIT[filters.group]} estimated={estimatedPeriods} />
       </Panel>
-      <ToolCards data={data} filters={filters} stats={stats} dailyCost={dailyCost} now={now} />
+      <ToolCards {...toolSummaries(data, filters, sessionReport, dailyCost)} filters={filters} now={now} />
       <div className="grid gap-3 lg:grid-cols-2">
         <Panel title="Token composition" description={`${formatTokens(stats.totalTokens)} tokens`} className="lg:col-span-2">
           <TokenComposition {...stats} />
         </Panel>
-        <TopModels data={data} filters={filters} />
-        <TopProjects data={data} filters={filters} estimated={stats.estimatedDays > 0} />
+        <TopModels report={topRows(reportFrom(data, "models", filters))} filters={filters} />
+        <TopProjects report={topRows(reportFrom(data, "projects", filters))} filters={filters} estimated={stats.estimatedDays > 0} />
       </div>
     </div>
   );
@@ -115,7 +118,27 @@ function series(report: Report, metric: Metric, group: Filters["group"]): Stacke
   });
 }
 
-function KpiRow({ stats, prev, days, cost, tokens }: { stats: PeriodStats; prev?: PeriodStats; days?: number; cost: StackedDatum[]; tokens: StackedDatum[] }) {
+type PeriodTotals = Omit<PeriodStats, "daily" | "sessionReport">;
+
+function totalsOf(stats: PeriodStats): PeriodTotals {
+  const { daily, sessionReport, ...totals } = stats;
+  void daily;
+  void sessionReport;
+  return totals;
+}
+
+/** The first rows of a report plus its totals, for the "top 5" panels. */
+interface TopRows {
+  rows: UsageRow[];
+  count: number;
+  totalCost: number;
+}
+
+function topRows(report: Report, n = 5): TopRows {
+  return { rows: report.rows.slice(0, n), count: report.rows.length, totalCost: report.totals.costUSD };
+}
+
+function KpiRow({ stats, prev, days, cost, tokens }: { stats: PeriodTotals; prev?: PeriodTotals; days?: number; cost: StackedDatum[]; tokens: StackedDatum[] }) {
   const vs = days ? `vs prev ${days}d` : undefined;
   // Percentages past +999% read as noise; those show the multiple in the sub line instead.
   const big = (cur: number, before: number | undefined) => {
@@ -172,11 +195,28 @@ function KpiRow({ stats, prev, days, cost, tokens }: { stats: PeriodStats; prev?
   );
 }
 
-function ToolCards({ data, filters, stats, dailyCost, now }: { data: UsageData; filters: Filters; stats: PeriodStats; dailyCost: StackedDatum[]; now: number }) {
+interface ToolSummary {
+  tool: ToolId;
+  costUSD: number;
+  totalTokens: number;
+  sessions: number;
+  activeMs: number;
+  share: number | null;
+  topModel?: string;
+  lastActive?: { at: number; estimated: boolean };
+  spark: number[];
+}
+
+function toolSummaries(
+  data: UsageData,
+  filters: Filters,
+  sessionReport: Report,
+  dailyCost: StackedDatum[],
+): { tools: ToolSummary[]; shareOf: "cost" | "tokens" } {
   const tools = reportFrom(data, "tools", filters);
   const byTool = new Map(tools.rows.map((r) => [r.key as ToolId, r]));
   const sessions = new Map<ToolId, { count: number; activeMs: number }>();
-  for (const row of stats.sessionReport.rows) {
+  for (const row of sessionReport.rows) {
     const m = sessionMeta(row);
     const s = sessions.get(m.tool) ?? { count: 0, activeMs: 0 };
     s.count += 1;
@@ -186,35 +226,42 @@ function ToolCards({ data, filters, stats, dailyCost, now }: { data: UsageData; 
   const last = lastActiveByTool(data);
   const byCost = tools.totals.costUSD > 0;
   const total = byCost ? tools.totals.costUSD : tools.totals.totalTokens;
+  const summaries = filters.tools.map((t): ToolSummary => {
+    const row = byTool.get(t);
+    const top = row ? [...row.breakdown].sort((a, b) => b.costUSD - a.costUSD || b.totalTokens - a.totalTokens)[0] : undefined;
+    const value = row ? (byCost ? row.costUSD : row.totalTokens) : 0;
+    return {
+      tool: t,
+      costUSD: row?.costUSD ?? 0,
+      totalTokens: row?.totalTokens ?? 0,
+      sessions: sessions.get(t)?.count ?? 0,
+      activeMs: sessions.get(t)?.activeMs ?? 0,
+      share: total > 0 ? value / total : null,
+      topModel: top?.model || undefined,
+      lastActive: last[t],
+      spark: dailyCost.map((d) => d.values[t] ?? 0),
+    };
+  });
+  return { tools: summaries, shareOf: byCost ? "cost" : "tokens" };
+}
 
+function ToolCards({ tools, shareOf, filters, now }: { tools: ToolSummary[]; shareOf: "cost" | "tokens"; filters: Filters; now: number }) {
   return (
     <section aria-labelledby="by-tool-heading">
       <h2 id="by-tool-heading" className="sr-only">
         By tool
       </h2>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        {filters.tools.map((t) => {
-          const row = byTool.get(t);
-          const top = row ? [...row.breakdown].sort((a, b) => b.costUSD - a.costUSD || b.totalTokens - a.totalTokens)[0] : undefined;
-          const value = row ? (byCost ? row.costUSD : row.totalTokens) : 0;
-          return (
-            <ToolCard
-              key={t}
-              tool={t}
-              costUSD={row?.costUSD ?? 0}
-              totalTokens={row?.totalTokens ?? 0}
-              sessions={sessions.get(t)?.count ?? 0}
-              activeMs={sessions.get(t)?.activeMs ?? 0}
-              share={total > 0 ? value / total : null}
-              shareOf={byCost ? "cost" : "tokens"}
-              topModel={top?.model || undefined}
-              lastActive={last[t]}
-              spark={dailyCost.map((d) => d.values[t] ?? 0)}
-              sessionsHref={`/sessions${filtersToQuery({ ...filters, tools: [t], allTools: false })}`}
-              now={now}
-            />
-          );
-        })}
+        {tools.map(({ tool: t, ...summary }) => (
+          <ToolCard
+            key={t}
+            tool={t}
+            {...summary}
+            shareOf={shareOf}
+            sessionsHref={`/sessions${filtersToQuery({ ...filters, tools: [t], allTools: false })}`}
+            now={now}
+          />
+        ))}
       </div>
     </section>
   );
@@ -239,16 +286,15 @@ function Tools({ tools }: { tools: ToolId[] }) {
   );
 }
 
-function TopModels({ data, filters }: { data: UsageData; filters: Filters }) {
-  const report = reportFrom(data, "models", filters);
-  const total = report.totals.costUSD;
+function TopModels({ report, filters }: { report: TopRows; filters: Filters }) {
+  const total = report.totalCost;
   const columns: DataColumn[] = [
     { key: "model", header: "Model", sortable: false },
     { key: "cost", header: "Cost", numeric: true, sortable: false },
     { key: "tokens", header: "Tokens", numeric: true, sortable: false, hideBelow: "sm" },
     { key: "share", header: "Share", numeric: true, sortable: false },
   ];
-  const rows: DataRow[] = report.rows.slice(0, 5).map((r) => ({
+  const rows: DataRow[] = report.rows.map((r) => ({
     id: r.key,
     cells: {
       model: (
@@ -265,21 +311,20 @@ function TopModels({ data, filters }: { data: UsageData; filters: Filters }) {
     },
   }));
   return (
-    <Panel title="Top models" description={`${formatNumber(report.rows.length)} models · by cost`} actions={<ViewAll href={`/models${filtersToQuery(filters)}`}>All models</ViewAll>}>
+    <Panel title="Top models" description={`${formatNumber(report.count)} models · by cost`} actions={<ViewAll href={`/models${filtersToQuery(filters)}`}>All models</ViewAll>}>
       <DataTable caption="Top 5 models by cost" columns={columns} rows={rows} emptyMessage="No models in this range." />
     </Panel>
   );
 }
 
-function TopProjects({ data, filters, estimated }: { data: UsageData; filters: Filters; estimated: boolean }) {
-  const report = reportFrom(data, "projects", filters);
+function TopProjects({ report, filters, estimated }: { report: TopRows; filters: Filters; estimated: boolean }) {
   const columns: DataColumn[] = [
     { key: "project", header: "Project", sortable: false },
     { key: "cost", header: "Cost", numeric: true, sortable: false },
     { key: "sessions", header: "Sessions", numeric: true, sortable: false, hideBelow: "sm" },
     { key: "tokens", header: "Tokens", numeric: true, sortable: false, hideBelow: "md" },
   ];
-  const rows: DataRow[] = report.rows.slice(0, 5).map((r) => ({
+  const rows: DataRow[] = report.rows.map((r) => ({
     id: r.key || "(unknown)",
     cells: {
       project: (
@@ -298,7 +343,7 @@ function TopProjects({ data, filters, estimated }: { data: UsageData; filters: F
   return (
     <Panel
       title="Top projects"
-      description={`${formatNumber(report.rows.length)} projects · by cost${estimated ? " · excludes estimated days" : ""}`}
+      description={`${formatNumber(report.count)} projects · by cost${estimated ? " · excludes estimated days" : ""}`}
       actions={<ViewAll href={`/projects${filtersToQuery(filters)}`}>All projects</ViewAll>}
     >
       <DataTable caption="Top 5 projects by cost" columns={columns} rows={rows} emptyMessage="No projects in this range." />
@@ -306,8 +351,7 @@ function TopProjects({ data, filters, estimated }: { data: UsageData; filters: F
   );
 }
 
-function EmptyState({ filters, data }: { filters: Filters; data: UsageData }) {
-  const found = Object.values(data.sources).reduce((s, list) => s + list.length, 0);
+function EmptyState({ filters, sourceCount: found }: { filters: Filters; sourceCount: number }) {
   const allTime = `/${filtersToQuery({ ...filters, range: "all", since: undefined, until: undefined })}`;
   const allTools = `/${filtersToQuery({ ...filters, tools: [], allTools: true })}`;
   return (

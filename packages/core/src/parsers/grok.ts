@@ -10,10 +10,10 @@
  * config.toml and auth.json are never read. The only text kept is summary.json's
  * generated_title (as the session title).
  */
-import { createReadStream, readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
-import { createInterface } from 'node:readline';
 import type {
   LoadOptions,
   ParseResult,
@@ -100,22 +100,22 @@ function readJson(p: string): unknown {
   }
 }
 
-/** Stream a JSONL file; invalid / partial lines are skipped. */
-async function* jsonl(path: string): AsyncIterable<unknown> {
-  const rl = createInterface({ input: createReadStream(path, { encoding: 'utf8' }), crlfDelay: Infinity });
-  try {
-    for await (const line of rl) {
-      const t = line.trim();
-      if (!t || t[0] !== '{') continue;
-      try {
-        yield JSON.parse(t);
-      } catch {
-        /* partial or corrupt line */
-      }
+/**
+ * Parse a JSONL file; invalid / partial lines are skipped. Read in one go and parsed
+ * synchronously (no per-line promises).
+ */
+async function jsonl(path: string): Promise<unknown[]> {
+  const out: unknown[] = [];
+  for (const line of (await readFile(path, 'utf8')).split('\n')) {
+    const t = line.trim();
+    if (!t || t[0] !== '{') continue;
+    try {
+      out.push(JSON.parse(t));
+    } catch {
+      /* partial or corrupt line */
     }
-  } finally {
-    rl.close();
   }
+  return out;
 }
 
 function idleGapActive(ts: number[], idleMs = IDLE_MS): number {
@@ -337,7 +337,7 @@ async function scanSession(dir: string, dirName: string, cwdFallback: string): P
   if (isFile(updates)) {
     s.hasUpdates = true;
     let lastTs: number | undefined;
-    for await (const rec of jsonl(updates)) {
+    for (const rec of await jsonl(updates)) {
       if (!isObj(rec) || !isObj(rec.params)) continue;
       const params = rec.params;
       const update = params.update;
@@ -375,7 +375,7 @@ async function scanSession(dir: string, dirName: string, cwdFallback: string): P
   const events = join(dir, 'events.jsonl');
   if (isFile(events)) {
     let start: number | undefined;
-    for await (const rec of jsonl(events)) {
+    for (const rec of await jsonl(events)) {
       if (!isObj(rec)) continue;
       const t = parseTime(rec.ts);
       if (t === undefined) continue;
@@ -415,7 +415,7 @@ async function scanLogs(
   const log = join(home, 'logs', 'unified.jsonl');
   if (wanted.size === 0 || !isFile(log)) return out;
   let idx = 0;
-  for await (const rec of jsonl(log)) {
+  for (const rec of await jsonl(log)) {
     idx++;
     if (!isObj(rec) || rec.msg !== 'shell.turn.inference_done') continue;
     const sid = str(rec.sid);
