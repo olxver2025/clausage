@@ -1,0 +1,333 @@
+import type { Report, ToolId, UsageRow } from "@clausage/core";
+import Link from "next/link";
+import { Suspense } from "react";
+import { DataTable, type DataColumn, type DataRow } from "@/components/charts/DataTable";
+import { KpiTile } from "@/components/charts/KpiTile";
+import { ToolDot } from "@/components/charts/Legend";
+import { TodayStrip } from "@/components/overview/TodayStrip";
+import { TokenComposition } from "@/components/overview/TokenComposition";
+import { ToolCard } from "@/components/overview/ToolCard";
+import { UsageChart } from "@/components/overview/UsageChart";
+import { dayStats, lastActiveByTool, periodStats, ratio, requestNow, sessionMeta, type PeriodStats } from "@/components/overview/stats";
+import { PageHeader, Panel } from "@/components/Panel";
+import { PanelSkeleton } from "@/components/Skeleton";
+import { getFilters, getUsage, reportFrom, type UsageData } from "@/lib/data";
+import { describeRange, filtersToQuery, previousPeriod, rangeDays, todayIn, type Filters } from "@/lib/filters";
+import { formatBucketKey, formatCost, formatDuration, formatNumber, formatPercent, formatTokens, shortPath } from "@/lib/format";
+import { fillDailyGaps, sumValues, toolValues, type Metric, type StackedDatum } from "@/lib/series";
+import { TOOL_LABELS } from "@/lib/tools";
+
+export const metadata = { title: "Overview" };
+
+export default function OverviewPage({ searchParams }: PageProps<"/">) {
+  return (
+    <>
+      <PageHeader title="Overview" />
+      <Suspense fallback={<OverviewSkeleton />}>
+        <Overview searchParams={searchParams} />
+      </Suspense>
+    </>
+  );
+}
+
+function OverviewSkeleton() {
+  return (
+    <div className="flex flex-col gap-3">
+      <PanelSkeleton height={44} label="Loading today…" />
+      <PanelSkeleton height={96} label="Loading totals…" />
+      <PanelSkeleton height={320} />
+    </div>
+  );
+}
+
+const UNIT = { daily: "day", weekly: "week", monthly: "month" } as const;
+
+async function Overview({ searchParams }: { searchParams: PageProps<"/">["searchParams"] }) {
+  const filters = await getFilters(searchParams);
+  const now = requestNow();
+  const today = todayIn(filters.tz, now);
+  const prevFilters = previousPeriod(filters, now);
+  const rangeHasToday = (!filters.since || filters.since <= today) && (!filters.until || filters.until >= today);
+  const [data, prev, todayData] = await Promise.all([
+    getUsage(filters),
+    prevFilters ? getUsage(prevFilters).catch(() => undefined) : undefined,
+    rangeHasToday ? undefined : getUsage({ ...filters, range: "custom", since: today, until: today, fresh: false }).catch(() => undefined),
+  ]);
+
+  const todayStats = dayStats((todayData ?? data).events, today, data.timezone);
+  const todayStrip = <TodayStrip day={today} stats={todayStats} now={now} />;
+
+  if (!data.events.length && !data.historical.length) {
+    return (
+      <div className="flex flex-col gap-3">
+        {todayStrip}
+        <EmptyState filters={filters} data={data} />
+      </div>
+    );
+  }
+
+  const stats = periodStats(data, filters);
+  const prevStats = prev ? periodStats(prev, prevFilters!) : undefined;
+  const days = rangeDays(filters, now);
+  const until = filters.until ?? today;
+
+  const dailyCost = fillDailyGaps(series(stats.daily, "costUSD", "daily"), filters.since, until, (k) => formatBucketKey(k, "daily"));
+  const dailyTokens = fillDailyGaps(series(stats.daily, "totalTokens", "daily"), filters.since, until, (k) => formatBucketKey(k, "daily"));
+  const ts = filters.group === "daily" ? stats.daily : reportFrom(data, filters.group, filters);
+  const chartCost = filters.group === "daily" ? dailyCost : series(ts, "costUSD", filters.group);
+  const chartTokens = filters.group === "daily" ? dailyTokens : series(ts, "totalTokens", filters.group);
+  const estimatedPeriods = ts.rows.filter((r) => r.meta?.historical).length;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <p className="text-xs text-fg-3">
+        {describeRange(filters)}
+        {filters.since && ` · ${filters.since} – ${until}`}
+        {!filters.allTools && ` · ${filters.tools.map((t) => TOOL_LABELS[t]).join(", ")}`}
+      </p>
+      {todayStrip}
+      <KpiRow stats={stats} prev={prevStats} days={days} cost={dailyCost} tokens={dailyTokens} />
+      <Panel title="Usage over time" description={`Stacked by tool · ${formatCost(ts.totals.costUSD)} · ${formatTokens(ts.totals.totalTokens)} tokens`}>
+        <UsageChart cost={chartCost} tokens={chartTokens} unit={UNIT[filters.group]} estimated={estimatedPeriods} />
+      </Panel>
+      <ToolCards data={data} filters={filters} stats={stats} dailyCost={dailyCost} now={now} />
+      <div className="grid gap-3 lg:grid-cols-2">
+        <Panel title="Token composition" description={`${formatTokens(stats.totalTokens)} tokens`} className="lg:col-span-2">
+          <TokenComposition {...stats} />
+        </Panel>
+        <TopModels data={data} filters={filters} />
+        <TopProjects data={data} filters={filters} estimated={stats.estimatedDays > 0} />
+      </div>
+    </div>
+  );
+}
+
+function series(report: Report, metric: Metric, group: Filters["group"]): StackedDatum[] {
+  return report.rows.map((row: UsageRow) => {
+    const base = formatBucketKey(row.key, group);
+    const estimated = Boolean(row.meta?.historical);
+    return {
+      key: row.key,
+      label: estimated ? `${base} (estimated)` : base,
+      short: estimated ? `${base}*` : undefined,
+      values: toolValues(row, metric),
+    };
+  });
+}
+
+function KpiRow({ stats, prev, days, cost, tokens }: { stats: PeriodStats; prev?: PeriodStats; days?: number; cost: StackedDatum[]; tokens: StackedDatum[] }) {
+  const vs = days ? `vs prev ${days}d` : undefined;
+  // Percentages past +999% read as noise; those show the multiple in the sub line instead.
+  const big = (cur: number, before: number | undefined) => {
+    const r = prev ? ratio(cur, before) : null;
+    return r !== null && r >= 10 ? `▲ ${Math.round(r + 1)}× ${vs ?? ""}`.trim() : undefined;
+  };
+  const delta = (cur: number, before: number | undefined) =>
+    prev && !big(cur, before) ? { ratio: ratio(cur, before), goodWhen: "neutral" as const, label: vs } : undefined;
+  const sub = (cur: number, before: number | undefined, rest?: string) => [big(cur, before), rest].filter(Boolean).join(" · ") || undefined;
+  const hitPts = stats.cacheHit !== null && prev?.cacheHit != null ? (stats.cacheHit - prev.cacheHit) * 100 : null;
+  return (
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+      <KpiTile
+        label="Total cost"
+        value={formatCost(stats.costUSD)}
+        delta={delta(stats.costUSD, prev?.costUSD)}
+        sub={sub(stats.costUSD, prev?.costUSD, stats.estimatedDays > 0 ? `incl. ${stats.estimatedDays} estimated day${stats.estimatedDays === 1 ? "" : "s"}` : undefined)}
+        spark={cost.map((d) => sumValues(d.values))}
+        sparkLabel="Daily cost"
+        className="col-span-2 lg:col-span-1"
+      />
+      <KpiTile
+        label="Total tokens"
+        value={formatTokens(stats.totalTokens)}
+        delta={delta(stats.totalTokens, prev?.totalTokens)}
+        sub={sub(stats.totalTokens, prev?.totalTokens)}
+        spark={tokens.map((d) => sumValues(d.values))}
+        sparkLabel="Daily tokens"
+        className="col-span-2 lg:col-span-1"
+      />
+      <KpiTile
+        label="Sessions"
+        value={formatNumber(stats.sessions)}
+        delta={delta(stats.sessions, prev?.sessions)}
+        sub={sub(stats.sessions, prev?.sessions, stats.sessions > 0 ? `${formatCost(stats.costUSD / stats.sessions)} avg` : undefined)}
+      />
+      <KpiTile
+        label="Active time"
+        value={formatDuration(stats.activeMs)}
+        delta={delta(stats.activeMs, prev?.activeMs)}
+        sub={sub(stats.activeMs, prev?.activeMs, stats.sessions > 0 ? `${formatDuration(stats.activeMs / stats.sessions)} per session` : undefined)}
+      />
+      <KpiTile
+        label="Cache-hit ratio"
+        className="col-span-2 lg:col-span-1"
+        value={stats.cacheHit === null ? "—" : formatPercent(stats.cacheHit)}
+        sub={
+          hitPts !== null
+            ? `${hitPts >= 0 ? "+" : "−"}${Math.abs(hitPts).toFixed(1)} pts ${vs ?? ""}`
+            : "cache read ÷ all input"
+        }
+      />
+    </div>
+  );
+}
+
+function ToolCards({ data, filters, stats, dailyCost, now }: { data: UsageData; filters: Filters; stats: PeriodStats; dailyCost: StackedDatum[]; now: number }) {
+  const tools = reportFrom(data, "tools", filters);
+  const byTool = new Map(tools.rows.map((r) => [r.key as ToolId, r]));
+  const sessions = new Map<ToolId, { count: number; activeMs: number }>();
+  for (const row of stats.sessionReport.rows) {
+    const m = sessionMeta(row);
+    const s = sessions.get(m.tool) ?? { count: 0, activeMs: 0 };
+    s.count += 1;
+    s.activeMs += m.activeMs || 0;
+    sessions.set(m.tool, s);
+  }
+  const last = lastActiveByTool(data);
+  const byCost = tools.totals.costUSD > 0;
+  const total = byCost ? tools.totals.costUSD : tools.totals.totalTokens;
+
+  return (
+    <section aria-labelledby="by-tool-heading">
+      <h2 id="by-tool-heading" className="sr-only">
+        By tool
+      </h2>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {filters.tools.map((t) => {
+          const row = byTool.get(t);
+          const top = row ? [...row.breakdown].sort((a, b) => b.costUSD - a.costUSD || b.totalTokens - a.totalTokens)[0] : undefined;
+          const value = row ? (byCost ? row.costUSD : row.totalTokens) : 0;
+          return (
+            <ToolCard
+              key={t}
+              tool={t}
+              costUSD={row?.costUSD ?? 0}
+              totalTokens={row?.totalTokens ?? 0}
+              sessions={sessions.get(t)?.count ?? 0}
+              activeMs={sessions.get(t)?.activeMs ?? 0}
+              share={total > 0 ? value / total : null}
+              shareOf={byCost ? "cost" : "tokens"}
+              topModel={top?.model || undefined}
+              lastActive={last[t]}
+              spark={dailyCost.map((d) => d.values[t] ?? 0)}
+              sessionsHref={`/sessions${filtersToQuery({ ...filters, tools: [t], allTools: false })}`}
+              now={now}
+            />
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function ViewAll({ href, children }: { href: string; children: string }) {
+  return (
+    <Link href={href} className="text-xs text-fg-2 underline-offset-2 hover:text-fg hover:underline">
+      {children} <span aria-hidden="true">→</span>
+    </Link>
+  );
+}
+
+function Tools({ tools }: { tools: ToolId[] }) {
+  return (
+    <span className="inline-flex shrink-0 gap-0.5">
+      {tools.map((t) => (
+        <ToolDot key={t} tool={t} />
+      ))}
+      <span className="sr-only">{tools.map((t) => TOOL_LABELS[t]).join(", ")}</span>
+    </span>
+  );
+}
+
+function TopModels({ data, filters }: { data: UsageData; filters: Filters }) {
+  const report = reportFrom(data, "models", filters);
+  const total = report.totals.costUSD;
+  const columns: DataColumn[] = [
+    { key: "model", header: "Model", sortable: false },
+    { key: "cost", header: "Cost", numeric: true, sortable: false },
+    { key: "tokens", header: "Tokens", numeric: true, sortable: false, hideBelow: "sm" },
+    { key: "share", header: "Share", numeric: true, sortable: false },
+  ];
+  const rows: DataRow[] = report.rows.slice(0, 5).map((r) => ({
+    id: r.key,
+    cells: {
+      model: (
+        <span className="flex min-w-0 items-center gap-1.5">
+          <Tools tools={r.tools} />
+          <span className="truncate font-mono" title={r.key}>
+            {r.label}
+          </span>
+        </span>
+      ),
+      cost: formatCost(r.costUSD),
+      tokens: formatTokens(r.totalTokens),
+      share: total > 0 ? formatPercent(r.costUSD / total) : "—",
+    },
+  }));
+  return (
+    <Panel title="Top models" description={`${formatNumber(report.rows.length)} models · by cost`} actions={<ViewAll href={`/models${filtersToQuery(filters)}`}>All models</ViewAll>}>
+      <DataTable caption="Top 5 models by cost" columns={columns} rows={rows} emptyMessage="No models in this range." />
+    </Panel>
+  );
+}
+
+function TopProjects({ data, filters, estimated }: { data: UsageData; filters: Filters; estimated: boolean }) {
+  const report = reportFrom(data, "projects", filters);
+  const columns: DataColumn[] = [
+    { key: "project", header: "Project", sortable: false },
+    { key: "cost", header: "Cost", numeric: true, sortable: false },
+    { key: "sessions", header: "Sessions", numeric: true, sortable: false, hideBelow: "sm" },
+    { key: "tokens", header: "Tokens", numeric: true, sortable: false, hideBelow: "md" },
+  ];
+  const rows: DataRow[] = report.rows.slice(0, 5).map((r) => ({
+    id: r.key || "(unknown)",
+    cells: {
+      project: (
+        <span className="flex min-w-0 items-center gap-1.5">
+          <Tools tools={r.tools} />
+          <span className="truncate font-mono" title={r.key || undefined}>
+            {r.key ? shortPath(r.key) : "(unknown)"}
+          </span>
+        </span>
+      ),
+      cost: formatCost(r.costUSD),
+      sessions: formatNumber(Number(r.meta?.sessions ?? 0)),
+      tokens: formatTokens(r.totalTokens),
+    },
+  }));
+  return (
+    <Panel
+      title="Top projects"
+      description={`${formatNumber(report.rows.length)} projects · by cost${estimated ? " · excludes estimated days" : ""}`}
+      actions={<ViewAll href={`/projects${filtersToQuery(filters)}`}>All projects</ViewAll>}
+    >
+      <DataTable caption="Top 5 projects by cost" columns={columns} rows={rows} emptyMessage="No projects in this range." />
+    </Panel>
+  );
+}
+
+function EmptyState({ filters, data }: { filters: Filters; data: UsageData }) {
+  const found = Object.values(data.sources).reduce((s, list) => s + list.length, 0);
+  const allTime = `/${filtersToQuery({ ...filters, range: "all", since: undefined, until: undefined })}`;
+  const allTools = `/${filtersToQuery({ ...filters, tools: [], allTools: true })}`;
+  return (
+    <Panel title="No usage in this range">
+      <div className="flex flex-col gap-3 text-sm text-fg-2">
+        <p>
+          Nothing was recorded in the selected range ({describeRange(filters)})
+          {!filters.allTools && ` in ${filters.tools.map((t) => TOOL_LABELS[t]).join(", ")}`}
+          {filters.project && ` for projects matching “${filters.project}”`}.
+        </p>
+        <p className="text-xs text-fg-3">
+          {found > 0
+            ? `${found} data folder${found === 1 ? " was" : "s were"} scanned. The footer lists them.`
+            : "No data folders were found for the selected tools. Run Claude Code, Codex, Grok Build or OpenCode at least once, or set the tool's data directory environment variable."}
+        </p>
+        <div className="flex flex-wrap gap-4 text-xs">
+          {filters.range !== "all" && <ViewAll href={allTime}>Show all time</ViewAll>}
+          {!filters.allTools && <ViewAll href={allTools}>Show all tools</ViewAll>}
+        </div>
+      </div>
+    </Panel>
+  );
+}

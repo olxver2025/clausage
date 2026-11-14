@@ -1,0 +1,11 @@
+{
+  "name": "clausage",
+  "version": "0.1.0",
+  "description": "Track token usage, cost and time across agentic coding tools: Claude Code, Codex, Grok Build, OpenCode",
+  "type": "module",
+  "bin": { "clausage": "./dist/index.js" },
+  "files": ["dist"],
+  "scripts": { "build": "tsc -p .", "start": "node dist/index.js" },
+  "dependencies": { "@clausage/core": "0.1.0" },
+  "engines": { "node": ">=22.5" }
+}
