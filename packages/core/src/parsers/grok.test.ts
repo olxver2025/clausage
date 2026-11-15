@@ -65,8 +65,8 @@ function makeHome(): string {
   );
   const lines = [
     envelope(sid, 1, t0, { sessionUpdate: 'user_message_chunk', content: { text: 'SECRET' }, _meta: { promptIndex: 0, modelId: 'grok-test' } }),
-    envelope(sid, 2, t0 + 1000, { sessionUpdate: 'tool_call', toolCallId: 'tc1', title: 'x' }),
-    envelope(sid, 3, t0 + 1500, { sessionUpdate: 'tool_call_update', toolCallId: 'tc1' }),
+    envelope(sid, 2, t0 + 1000, { sessionUpdate: 'tool_call', toolCallId: 'tc1', title: 'Run SECRET-CMD', _meta: { 'x.ai/tool': { name: 'run_command' } } }),
+    envelope(sid, 3, t0 + 1500, { sessionUpdate: 'tool_call_update', toolCallId: 'tc1', _meta: { 'x.ai/tool': { name: 'run_command' } } }),
     envelope(sid, 4, t0 + 2000, { sessionUpdate: 'tool_call', toolCallId: 'tc2', title: 'y' }),
     envelope(sid, 5, t0 + 5000, { sessionUpdate: 'turn_completed', prompt_id: 'p1', stop_reason: 'end_turn', elapsed_ms: 4000, usage: u1 }, '_x.ai/session/update'),
     envelope(sid, 6, t0 + 60000, { sessionUpdate: 'user_message_chunk', content: { text: 'SECRET' }, _meta: { promptIndex: 1 } }),
@@ -116,6 +116,9 @@ test('grok parser: per-turn per-model events with normalised tokens', async () =
     assert.equal(s.title, 'Synthetic title');
     assert.equal(s.userMessages, 2);
     assert.equal(s.toolCalls, 2);
+    // tc2 carries no tool name: counted in toolCalls only; titles (which may hold arguments) are never kept
+    assert.deepEqual(s.toolCallsByName, { run_command: 1 });
+    assert.ok(!JSON.stringify(r).includes('SECRET'));
     assert.equal(s.turns, 3);
     assert.equal(s.assistantMessages, 4);
     assert.equal(s.activeMs, 5500);

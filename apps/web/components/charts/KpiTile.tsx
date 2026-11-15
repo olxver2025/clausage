@@ -34,8 +34,12 @@ export function KpiTile({ label, value, sub, delta, spark, sparkLabel, tool, cla
         <span className="truncate">{label}</span>
       </div>
       <div className="flex items-end justify-between gap-2">
-        <div className="figure min-w-0 truncate text-xl font-semibold leading-tight text-fg">{value}</div>
-        {spark && spark.length > 1 && <Sparkline values={spark} label={sparkLabel ?? `${label} trend`} width={72} height={24} />}
+        <div className="figure shrink-0 text-xl font-semibold leading-tight whitespace-nowrap text-fg">{value}</div>
+        {spark && spark.length > 1 && (
+          <div className="flex min-w-0 justify-end overflow-hidden">
+            <Sparkline values={spark} label={sparkLabel ?? `${label} trend`} width={72} height={24} />
+          </div>
+        )}
       </div>
       {(delta || sub) && (
         <div className="flex flex-wrap items-baseline gap-x-2 text-xs text-fg-3">

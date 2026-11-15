@@ -71,7 +71,9 @@ function setup(): string {
   const sub = [
     JSON.stringify({ type: 'agent-name', agentName: 'helper', sessionId: SID }),
     JSON.stringify({ type: 'user', isSidechain: true, agentId: 'abc', sessionId: SID, timestamp: '2026-11-01T10:00:05.000Z', message: { content: 'task' } }),
-    assistant({ msgId: 'msg_D', reqId: 'req_D', ts: '2026-11-01T10:00:06.000Z', sidechain: true, agentId: 'abc', content: [{ type: 'tool_use', id: 'toolu_2' }, { type: 'tool_use', id: 'toolu_3' }] }),
+    assistant({ msgId: 'msg_D', reqId: 'req_D', ts: '2026-11-01T10:00:06.000Z', sidechain: true, agentId: 'abc', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Read', input: { file_path: 'SECRET' } }, { type: 'tool_use', id: 'toolu_3', name: 'mcp__github__create_pr' }] }),
+    // a repeated tool_use block (split response line) counts once
+    assistant({ msgId: 'msg_D', reqId: 'req_D', ts: '2026-11-01T10:00:06.000Z', sidechain: true, agentId: 'abc', content: [{ type: 'tool_use', id: 'toolu_3', name: 'mcp__github__create_pr' }] }),
     // copy of a parent request (forked history) must be deduped globally
     assistant({ msgId: 'msg_A', reqId: 'req_A', ts: '2026-11-01T10:00:01.000Z', sidechain: true, agentId: 'abc' }),
   ].join('\n');
@@ -132,6 +134,7 @@ test('claude-code parser: dedupe, mapping, sessions, historical', async () => {
     assert.equal(main.userMessages, 1);
     assert.equal(main.assistantMessages, 3);
     assert.equal(main.toolCalls, 1);
+    assert.deepEqual(main.toolCallsByName, { Bash: 1 });
     assert.equal(main.version, '2.1.0');
     assert.deepEqual(main.models, ['claude-opus-5-5']);
     // 10:00:00 -> 10:01:30 active (all gaps < 5min), then idle gap to 11:00
@@ -145,6 +148,7 @@ test('claude-code parser: dedupe, mapping, sessions, historical', async () => {
     assert.equal(sub.userMessages, 0);
     assert.equal(sub.turns, 1);
     assert.equal(sub.toolCalls, 2);
+    assert.deepEqual(sub.toolCallsByName, { Read: 1, mcp__github__create_pr: 1 });
     assert.equal(sub.assistantMessages, 1);
 
     // historical only for 2026-09-01
@@ -161,7 +165,7 @@ test('claude-code parser: dedupe, mapping, sessions, historical', async () => {
     assert.equal(y.messages, undefined);
 
     // privacy: no prompt text anywhere in the output
-    assert.ok(!JSON.stringify(r).includes('SECRET PROMPT'));
+    assert.ok(!JSON.stringify(r).includes('SECRET'));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -187,7 +191,7 @@ test('forked / resumed history stays with the original session regardless of fil
     const ORIG = 'bbbbbbbb-0000-0000-0000-000000000000';
     const usage = { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 };
     const asst = (sid: string, n: number, ts: string, uuid: string) =>
-      JSON.stringify({ type: 'assistant', sessionId: sid, uuid, cwd: 'D:/x', timestamp: ts, requestId: `r${n}`, message: { id: `m${n}`, model: 'claude-opus-5-5', usage, content: [{ type: 'tool_use', id: `toolu_${n}` }] } });
+      JSON.stringify({ type: 'assistant', sessionId: sid, uuid, cwd: 'D:/x', timestamp: ts, requestId: `r${n}`, message: { id: `m${n}`, model: 'claude-opus-5-5', usage, content: [{ type: 'tool_use', id: `toolu_${n}`, name: n === 1 ? 'Edit' : 'x'.repeat(100) }] } });
     const user = (sid: string, ts: string, uuid: string) =>
       JSON.stringify({ type: 'user', sessionId: sid, uuid, timestamp: ts, message: { content: 'x' } });
     writeFileSync(path.join(proj, `${ORIG}.jsonl`), [user(ORIG, '2026-11-01T10:00:00Z', 'u1'), asst(ORIG, 1, '2026-11-01T10:00:01Z', 'a1')].join('\n'));
@@ -206,8 +210,52 @@ test('forked / resumed history stays with the original session regardless of fil
     assert.equal(orig.userMessages, 1);
     assert.equal(fork.assistantMessages, 1);
     assert.equal(fork.toolCalls, 1);
+    // the copied call stays with the original; long names are capped at 80 characters
+    assert.deepEqual(orig.toolCallsByName, { Edit: 1 });
+    assert.deepEqual(fork.toolCallsByName, { ['x'.repeat(80)]: 1 });
     assert.equal(fork.userMessages, 1);
     assert.equal(fork.startedAt, Date.parse('2026-11-02T10:00:00Z'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('usage-limit refusals become limit hits (flags and the synthetic limit message only)', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'clausage-cc-limits-'));
+  try {
+    const dir = path.join(root, 'projects', 'proj');
+    mkdirSync(dir, { recursive: true });
+    const err = (ts: string, uuid: string, text: string, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        type: 'assistant',
+        sessionId: SID,
+        uuid,
+        timestamp: ts,
+        isApiErrorMessage: true,
+        ...extra,
+        message: { id: `m-${uuid}`, model: '<synthetic>', content: [{ type: 'text', text }], usage: { input_tokens: 0, output_tokens: 0 } },
+      });
+    writeFileSync(
+      path.join(dir, `${SID}.jsonl`),
+      [
+        assistant({ msgId: 'a', reqId: 'r', ts: '2026-11-10T09:00:00.000Z' }),
+        err('2026-11-10T10:00:00.000Z', 'u1', 'Claude AI usage limit reached|1794744000'),
+        // a repeat within the hour is the same hit
+        err('2026-11-10T10:20:00.000Z', 'u2', 'Claude AI usage limit reached|1794744000'),
+        err('2026-11-10T14:00:00.000Z', 'u3', 'Request failed', { error: 'rate_limit' }),
+        // other API errors are not limit hits
+        err('2026-11-10T16:00:00.000Z', 'u4', 'API Error: 500 Internal server error'),
+      ].join('\n') + '\n',
+    );
+    const r = await claudeCodeParser.load({ paths: { 'claude-code': [root] } });
+    assert.deepEqual(
+      r.limitHits?.map((h) => [new Date(h.timestamp).toISOString(), h.resetsAt]),
+      [
+        ['2026-11-10T10:00:00.000Z', 1794744000 * 1000],
+        ['2026-11-10T14:00:00.000Z', undefined],
+      ],
+    );
+    assert.equal(r.events.length, 1, 'synthetic entries are still not usage');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

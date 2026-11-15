@@ -14,6 +14,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { fastDeployment, usageSpeed } from './speed.js';
 import snapshot from './pricing-snapshot.json' with { type: 'json' };
 import type { CostMode, DailyAggregate, ModelPricing, ToolId, UsageEvent } from './types.js';
 
@@ -38,9 +39,9 @@ export interface PriceResolution {
 }
 
 const PRICE_FIELD =
-  /^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|cache_creation_input_token_cost)(_above_1hr)?(_above_\d+k_tokens)?(_priority|_flex)?$/;
+  /^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|cache_creation_input_token_cost)(_above_1hr)?(_above_\d+k_tokens)?(_priority|_ultrafast|_flex)?$/;
 const TIER_FIELD =
-  /^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|cache_creation_input_token_cost)_above_(\d+)k_tokens(_priority|_flex)?$/;
+  /^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|cache_creation_input_token_cost)_above_(\d+)k_tokens(_priority|_ultrafast|_flex)?$/;
 const KEEP_MODES = new Set(['chat', 'responses', 'completion']);
 
 /** Reduce a raw LiteLLM document to priced chat/responses entries with pricing fields only. */
@@ -66,6 +67,12 @@ function num(e: RawPriceEntry, f: string): number | undefined {
   const v = e[f];
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
 }
+
+const CLAUDE_FAST_INPUT: Record<string, number> = {
+  'claude-opus-4-6': 30, 'claude-opus-4-7': 30, // historical successful Fast responses
+  'claude-opus-4-8': 10, 'claude-opus-5': 10, 'claude-opus-5-5': 8,
+  'claude-fable-5-2': 16, 'claude-mythos-5-2': 16,
+};
 
 /** Convert a reduced LiteLLM entry to ModelPricing. Returns null when input/output price is missing. */
 export function toModelPricing(key: string, e: RawPriceEntry): ModelPricing | null {
@@ -107,7 +114,7 @@ export function toModelPricing(key: string, e: RawPriceEntry): ModelPricing | nu
   if (baseTiers) p.tiers = baseTiers;
 
   // service-tier variants (Codex / OpenAI "priority" = Fast, "flex")
-  for (const variant of ['priority', 'flex'] as const) {
+  for (const variant of ['priority', 'ultrafast', 'flex'] as const) {
     const vin = num(e, `input_cost_per_token_${variant}`);
     const vout = num(e, `output_cost_per_token_${variant}`);
     if (vin === undefined || vout === undefined) continue;
@@ -120,13 +127,21 @@ export function toModelPricing(key: string, e: RawPriceEntry): ModelPricing | nu
     if (vt) v.tiers = vt;
     (p.serviceTiers ??= {})[variant] = v;
   }
+  // Anthropic publishes Fast separately from LiteLLM. These are USD per million
+  // input tokens; output is 5x input and prompt caching keeps its model-specific ratio.
+  // https://platform.claude.com/docs/en/build-with-claude/fast-mode
+  const fastInput = CLAUDE_FAST_INPUT[stripDate(key)];
+  if (e.litellm_provider === 'anthropic' && fastInput && !p.serviceTiers?.priority) {
+    (p.serviceTiers ??= {}).priority = { input: fastInput / 1e6, output: fastInput * 5 / 1e6, tiers: [] };
+  }
   return p;
 }
 
 /** Map an event's recorded speed / service tier to a LiteLLM service-tier variant. */
-export function serviceTierOf(speed: string | undefined): 'priority' | 'flex' | undefined {
+export function serviceTierOf(speed: string | undefined): 'priority' | 'ultrafast' | 'flex' | undefined {
   const s = speed?.toLowerCase();
   if (s === 'priority' || s === 'fast') return 'priority';
+  if (s === 'ultrafast') return 'ultrafast';
   if (s === 'flex') return 'flex';
   return undefined;
 }
@@ -135,7 +150,7 @@ export function serviceTierOf(speed: string | undefined): 'priority' | 'flex' | 
  * Pricing for a service tier ('priority' / 'flex'); the base pricing when the model has no such
  * variant. Rates the variant lacks are the base rates scaled by the variant's input ratio.
  */
-export function pricingForServiceTier(p: ModelPricing, tier: 'priority' | 'flex' | undefined): ModelPricing {
+export function pricingForServiceTier(p: ModelPricing, tier: 'priority' | 'ultrafast' | 'flex' | undefined): ModelPricing {
   const v = tier ? p.serviceTiers?.[tier] : undefined;
   if (!v) return p;
   const r = p.input > 0 ? v.input / p.input : 1;
@@ -196,6 +211,15 @@ const TOOL_KEY_PREFIXES: Record<ToolId, string[]> = {
   codex: ['', 'openai/'],
   grok: ['xai/'],
   opencode: [],
+  // multi-provider agents: rely on the event's provider and the generic fallbacks
+  hermes: [],
+  openclaw: [],
+  pi: [],
+  gemini: ['gemini/', 'vertex_ai/'],
+  amp: [''],
+  qwen: ['', 'dashscope/'],
+  copilot: [],
+  aider: [],
 };
 
 /** Every prefix tried as a last resort, in order. */
@@ -267,14 +291,22 @@ function cmpVersion(a: number[], b: number[]): number {
 // PricingTable
 // ---------------------------------------------------------------------------------------------
 
+export interface PricingSnapshot {
+  raw: RawPriceTable;
+  source: PricingSource;
+  fetchedAt?: string;
+}
+
 export class PricingTable {
   readonly source: PricingSource;
   /** ISO time the data was fetched (live/cache), if known */
   readonly fetchedAt?: string;
   private readonly entries = new Map<string, ModelPricing>();
   private readonly memo = new Map<string, PriceResolution | null>();
+  private readonly raw: RawPriceTable;
 
   constructor(raw: RawPriceTable, source: PricingSource, fetchedAt?: string) {
+    this.raw = raw;
     this.source = source;
     this.fetchedAt = fetchedAt;
     for (const [key, e] of Object.entries(raw)) {
@@ -285,6 +317,15 @@ export class PricingTable {
 
   get size(): number {
     return this.entries.size;
+  }
+
+  /** Plain data that rebuilds this table with PricingTable.fromSnapshot (e.g. across a worker boundary). */
+  toSnapshot(): PricingSnapshot {
+    return { raw: this.raw, source: this.source, fetchedAt: this.fetchedAt };
+  }
+
+  static fromSnapshot(s: PricingSnapshot): PricingTable {
+    return new PricingTable(s.raw, s.source, s.fetchedAt);
   }
 
   has(key: string): boolean {
@@ -362,6 +403,11 @@ export class PricingTable {
     const prefixes = this.prefixesFor(tool, provider);
     const direct = this.tryName(norm, prefixes);
     if (direct) return { pricing: direct, match: direct.key.toLowerCase() === norm ? 'normalized' : 'prefixed' };
+
+    if (fastDeployment(norm)) {
+      const deployment = this.get(`azure_ai/${norm}`);
+      if (deployment) return { pricing: deployment, match: 'prefixed' };
+    }
 
     const undated = stripDate(norm);
     if (undated !== norm) {
@@ -465,7 +511,15 @@ async function writeCache(dir: string, file: string, data: CacheFile): Promise<v
 }
 
 function merged(primary: RawPriceTable): RawPriceTable {
-  return { ...embeddedSnapshot(), ...primary };
+  const embedded = embeddedSnapshot();
+  const result = { ...embedded, ...primary };
+  // Older on-disk caches were reduced without Ultrafast fields.
+  for (const [key, entry] of Object.entries(primary)) {
+    if (entry.input_cost_per_token_ultrafast !== undefined || !embedded[key]?.input_cost_per_token_ultrafast) continue;
+    const ultra = Object.fromEntries(Object.entries(embedded[key]!).filter(([f]) => f.endsWith('_ultrafast')));
+    result[key] = { ...ultra, ...entry };
+  }
+  return result;
 }
 
 export async function loadPricing(opts: LoadPricingOptions = {}): Promise<PricingTable> {
@@ -564,16 +618,24 @@ export function costForTokens(t: TokenCounts, p: ModelPricing, opts: { applyTier
   );
 }
 
+/** Resolve the actual mode price, leaving an unpriced premium mode unknown. */
+export function usagePricing(p: ModelPricing, model: string, speed?: string): ModelPricing | null {
+  const tier = serviceTierOf(usageSpeed(model, speed));
+  if (tier === 'priority' && fastDeployment(p.key)) return p; // already priced as Fast
+  if ((tier === 'priority' || tier === 'ultrafast') && !p.serviceTiers?.[tier]) return null;
+  return pricingForServiceTier(p, tier);
+}
+
 /**
  * Cost of one event at the given pricing.
- * Events whose `speed` is 'priority'/'fast' or 'flex' use the model's service-tier variant when
- * LiteLLM has one (e.g. Codex Fast = `*_priority`), else the standard rates.
+ * Uses the recorded mode; a premium tier without a price contributes zero to calculated totals.
  * Tiers are NOT applied to Grok events: a Grok event is a whole turn summed over many model calls
  * (modelCalls/numTurns), so its prompt total is far larger than any single request's and would wrongly
  * trip the 200k long-context tier. Grok records its own invoice cost (costUsdTicks) anyway.
  */
 export function costForEvent(e: UsageEvent, p: ModelPricing): number {
-  return costForTokens(e, pricingForServiceTier(p, serviceTierOf(e.speed)), { applyTiers: e.tool !== 'grok' });
+  const price = usagePricing(p, e.model, e.speed);
+  return price ? costForTokens(e, price, { applyTiers: e.tool !== 'grok' }) : 0;
 }
 
 /**
@@ -617,8 +679,9 @@ export function applyCosts(
       continue;
     }
     const r = table.resolve(e.model, e.tool, e.provider, e.timestamp);
-    if (r) {
-      e.costUSD = costForEvent(e, r.pricing);
+    const price = r && usagePricing(r.pricing, e.model, e.speed);
+    if (r && price) {
+      e.costUSD = costForTokens(e, price, { applyTiers: e.tool !== 'grok' });
       e.costUnknown = false;
       if (r.match === 'alias' || r.match === 'family' || r.match === 'shortened') {
         once(`fb|${e.tool}|${e.model}|${r.pricing.key}`, `No exact price for ${e.model || '(unknown model)'} (${e.tool}); priced as ${r.pricing.key}`);
@@ -629,7 +692,8 @@ export function applyCosts(
     } else {
       e.costUSD = 0;
       e.costUnknown = true;
-      once(`nf|${e.tool}|${e.model}`, `No price for model ${e.model || '(unknown model)'} (${e.tool}); cost counted as $0`);
+      const mode = usageSpeed(e.model, e.speed);
+      once(`nf|${e.tool}|${e.model}|${mode ?? ''}`, `No price for model ${e.model || '(unknown model)'} (${e.tool}${mode ? ', ' + mode : ''}); cost counted as $0`);
     }
   }
 }

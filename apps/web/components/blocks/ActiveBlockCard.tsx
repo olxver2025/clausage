@@ -38,6 +38,13 @@ export function ActiveBlockCard({ block, now, timeZone }: { block: BlockSummary;
         <Stat label="Sessions" value={String(block.sessions)} />
         <Stat label="Burn rate" value={block.tokensPerMinute !== null ? `${formatCompact(block.tokensPerMinute)}/min` : "–"} />
         <Stat label="Cost rate" value={block.costPerHour !== null ? `${formatCost(block.costPerHour)}/h` : "–"} />
+        {block.limitPercent !== null && (
+          <Stat
+            label={block.limitSource === "reported" ? "5h limit used" : "Of your 5h limit"}
+            value={`${Math.round(block.limitPercent)}%`}
+            sub={block.limitHit ? <span className="font-medium text-critical">limit hit</span> : undefined}
+          />
+        )}
         <Stat
           label="Projected at end"
           value={block.projectedTokens !== null ? formatCompact(block.projectedTokens) : "–"}

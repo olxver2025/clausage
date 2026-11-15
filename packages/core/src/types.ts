@@ -1,12 +1,45 @@
-export type ToolId = 'claude-code' | 'codex' | 'grok' | 'opencode';
+export type ToolId =
+  | 'claude-code'
+  | 'codex'
+  | 'grok'
+  | 'opencode'
+  | 'hermes'
+  | 'openclaw'
+  | 'pi'
+  | 'gemini'
+  | 'amp'
+  | 'qwen'
+  | 'copilot'
+  | 'aider';
 
-export const TOOL_IDS: readonly ToolId[] = ['claude-code', 'codex', 'grok', 'opencode'];
+export const TOOL_IDS: readonly ToolId[] = [
+  'claude-code',
+  'codex',
+  'grok',
+  'opencode',
+  'hermes',
+  'openclaw',
+  'pi',
+  'gemini',
+  'amp',
+  'qwen',
+  'copilot',
+  'aider',
+];
 
 export const TOOL_LABELS: Record<ToolId, string> = {
   'claude-code': 'Claude Code',
   codex: 'Codex',
   grok: 'Grok Build',
   opencode: 'OpenCode',
+  hermes: 'Hermes Agent',
+  openclaw: 'OpenClaw',
+  pi: 'Pi',
+  gemini: 'Gemini CLI',
+  amp: 'Amp',
+  qwen: 'Qwen Code',
+  copilot: 'Copilot CLI',
+  aider: 'Aider',
 };
 
 /**
@@ -31,6 +64,8 @@ export interface UsageEvent {
   isSubagent: boolean;
   /** absolute project directory (normalised, no \\?\ prefix) or '' if unknown */
   project: string;
+  /** computer the usage was recorded on (set by the loader when sync is configured) */
+  machine?: string;
   model: string;
   provider?: string;
   inputTokens: number;
@@ -59,6 +94,8 @@ export interface SessionInfo {
   isSubagent: boolean;
   title?: string;
   project: string;
+  /** computer the session ran on (set by the loader when sync is configured) */
+  machine?: string;
   /** epoch ms */
   startedAt: number;
   /** epoch ms of last activity */
@@ -71,6 +108,12 @@ export interface SessionInfo {
   userMessages: number;
   assistantMessages: number;
   toolCalls: number;
+  /**
+   * Tool calls per tool name (e.g. `Bash`, `apply_patch`, `mcp__github__create_pr`), when the
+   * tool's logs record names. Names only: arguments, inputs and outputs are never read.
+   * `toolCalls` equals the sum of the values, or is larger when some calls carry no name.
+   */
+  toolCallsByName?: Record<string, number>;
   turns: number;
   models: string[];
   version?: string;
@@ -90,10 +133,66 @@ export interface DailyAggregate {
   sessions?: number;
   toolCalls?: number;
   source: string;
+  /** computer the aggregate came from (set by the loader when sync is configured) */
+  machine?: string;
   /** filled in by the loader (priced like an event); absent until costed */
   costUSD?: number;
   /** true when the loader could not price this aggregate */
   costUnknown?: boolean;
+}
+
+/** One usage-limit window as reported by a tool (e.g. Codex's 5-hour and weekly windows). */
+export interface LimitWindow {
+  /** 0-100 */
+  usedPercent: number;
+  windowMinutes: number;
+  /** epoch ms when the window resets */
+  resetsAt: number;
+}
+
+/** A tool's own report of how much of its usage limits is used, at one moment. */
+export interface LimitSnapshot {
+  tool: ToolId;
+  /** epoch ms */
+  timestamp: number;
+  /** the short window (5 hours for Codex) */
+  primary?: LimitWindow;
+  /** the long window (weekly for Codex) */
+  secondary?: LimitWindow;
+  planType?: string;
+  /** further windows the tool reports, e.g. a model-specific weekly limit */
+  extra?: Array<{ key: string; label: string; window: LimitWindow }>;
+  machine?: string;
+  /** Non-reversible account fingerprint; prevents comparing different accounts. */
+  accountKey?: string;
+  /** Missing means the provider did not supply reset availability. */
+  resets?: ResetAvailability;
+}
+
+export interface ResetGrant {
+  id: string;
+  label: string;
+  remaining: number;
+  expiresAt?: number;
+  usableNow?: boolean;
+}
+
+export interface ResetAvailability {
+  availableCount: number;
+  /** Missing means only the total is known; an empty list means no detail rows. */
+  grants?: ResetGrant[];
+}
+
+/** A request the provider refused because a usage limit was reached. */
+export interface LimitHit {
+  tool: ToolId;
+  /** epoch ms */
+  timestamp: number;
+  /** which limit, when the tool says (e.g. 'primary', 'secondary', 'five_hour', 'weekly') */
+  kind?: string;
+  /** epoch ms when the tool said the limit resets */
+  resetsAt?: number;
+  machine?: string;
 }
 
 export interface LoadOptions {
@@ -113,6 +212,10 @@ export interface ParseResult {
   historical: DailyAggregate[];
   /** data dirs that were found and scanned */
   sources: string[];
+  /** usage-limit snapshots reported by the tool, oldest first (only when the tool records them) */
+  limits?: LimitSnapshot[];
+  /** requests refused because a usage limit was reached */
+  limitHits?: LimitHit[];
 }
 
 export interface ToolParser {
@@ -144,7 +247,7 @@ export interface ModelPricing {
    */
   serviceTiers?: Partial<
     Record<
-      'priority' | 'flex',
+      'priority' | 'ultrafast' | 'flex',
       {
         input: number;
         output: number;
@@ -172,6 +275,7 @@ export interface TokenTotals {
 }
 
 export interface ModelBreakdown extends TokenTotals {
+  speed?: string;
   model: string;
   tool: ToolId;
 }

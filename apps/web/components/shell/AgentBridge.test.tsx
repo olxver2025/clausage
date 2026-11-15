@@ -93,6 +93,6 @@ test("get_usage_report fetches /api/usage with the current filters", async () =>
 
 test("filterPatchFromInput ignores unknown values and dates imply custom", () => {
   expect(filterPatchFromInput({ range: "5y", mode: "free", since: "2026-01-01" })).toEqual({ range: "custom", since: "2026-01-01" });
-  expect(filterPatchFromInput({ tools: [] })).toEqual({ tools: ["claude-code", "codex", "grok", "opencode"] });
+  expect(filterPatchFromInput({ tools: [] })).toEqual({ tools: ["claude-code", "codex", "grok", "opencode", "hermes", "openclaw", "pi", "gemini", "amp", "qwen", "copilot", "aider"] });
   expect(filterPatchFromInput({ project: "" })).toEqual({ project: null });
 });

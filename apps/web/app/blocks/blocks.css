@@ -1,0 +1,22 @@
+@layer components {
+  /* Usage-limit meters (components/blocks/UsageLimits.tsx) */
+  .limit-track {
+    position: relative;
+    height: 0.5rem;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--surface-2);
+  }
+  .limit-fill,
+  .limit-projected {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    border-radius: inherit;
+    background: var(--fill);
+  }
+  .limit-projected {
+    opacity: 0.28;
+    background: repeating-linear-gradient(-45deg, var(--fill) 0 3px, transparent 3px 6px);
+  }
+}

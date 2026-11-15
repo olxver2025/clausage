@@ -1,4 +1,4 @@
-import { loadUsage, type LoadUsageResult } from '@clausage/core';
+import { loadSyncConfig, loadUsage, reportToDelimited, type LoadUsageResult, type Report } from '@clausage/core';
 import type { CliOptions } from './args.js';
 import { c } from './format.js';
 
@@ -24,6 +24,8 @@ export async function loadData(
     includeSubagents: opts.subagents,
     project: opts.project,
     timezone: opts.timezone,
+    // other computers' usage from the sync folder, unless --local
+    ...(opts.local ? {} : { sync: loadSyncConfig() }),
   });
   const uniqueWarnings = [...new Set(res.warnings)];
   return { ...res, uniqueWarnings };
@@ -47,4 +49,12 @@ export function printJson(value: unknown): void {
 export function noData(opts: CliOptions, what = 'usage data'): void {
   const range = opts.sinceDate || opts.untilDate ? ` for ${opts.sinceDate ?? '…'} – ${opts.untilDate ?? '…'}` : '';
   process.stdout.write(c.yellow(`No ${what} found${range}.`) + '\n');
+}
+
+/** CSV / TSV / JSON Lines output of a report (`--format`); returns false for table and json. */
+export function printDelimitedReport(report: Report, opts: CliOptions): boolean {
+  if (opts.format !== 'csv' && opts.format !== 'tsv' && opts.format !== 'jsonl') return false;
+  printWarnings(report.warnings, opts);
+  process.stdout.write(reportToDelimited(report, opts.format, { breakdown: opts.breakdown }));
+  return true;
 }

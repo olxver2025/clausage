@@ -1,6 +1,6 @@
-import { buildReport, sumTotals, type BlockMeta, type UsageRow } from '@clausage/core';
+import { buildReport, loadLimitConfig, reportedWindows, sumTotals, type BlockMeta, type ToolId, type UsageRow } from '@clausage/core';
 import type { CliOptions } from '../args.js';
-import { loadData, noData, printJson, printWarnings } from '../context.js';
+import { loadData, noData, printDelimitedReport, printJson, printWarnings } from '../context.js';
 import {
   c,
   fmtDateTime,
@@ -38,6 +38,18 @@ export async function runBlocks(opts: CliOptions): Promise<void> {
     breakdown: true,
     sessionLengthHours: opts.sessionLength,
     now,
+    // the provider's reported 5-hour windows (Codex) and your configured 5-hour limits
+    ...(opts.sessionLength === 5
+      ? {
+          blockLimits: {
+            anchors: reportedWindows(data.limits),
+            fiveHourTokens: Object.fromEntries(
+              Object.entries(loadLimitConfig()).flatMap(([t, c]) => (c?.fiveHourTokens ? [[t as ToolId, c.fiveHourTokens]] : [])),
+            ),
+            hits: data.limitHits,
+          },
+        }
+      : {}),
   });
   if (opts.active) {
     report.rows = report.rows.filter((r) => meta(r).isActive);
@@ -50,6 +62,7 @@ export async function runBlocks(opts: CliOptions): Promise<void> {
   else limit = opts.tokenLimit;
 
   if (opts.json) return printJson({ ...report, tokenLimit: limit ?? null });
+  if (printDelimitedReport(report, opts)) return;
   printWarnings(data.uniqueWarnings, opts);
   if (!report.rows.length) return noData(opts, opts.active ? 'active billing block' : 'billing blocks');
 

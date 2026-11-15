@@ -7,13 +7,16 @@
  * Both are merged and deduped by message id.
  *
  * Privacy: only metadata and numbers are extracted. From SQLite we pull individual JSON fields with
- * json_extract so message/part text never enters this process. Legacy JSON files must be parsed whole,
+ * json_extract so message/part text never enters this process (of a tool part, only its `tool` name). Legacy JSON files must be parsed whole,
  * but only numeric/metadata fields are retained. Account / credential tables and auth.json are never read.
  */
 import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, join, resolve, basename } from 'node:path';
 import type { LoadOptions, ParseResult, SessionInfo, ToolParser, UsageEvent } from '../types.js';
+
+import { providerSpeed } from '../speed.js';
+import { countToolCall, toolCallName, toolCallsRecord } from './util.js';
 
 const TOOL = 'opencode' as const;
 const IDLE_MS = 5 * 60 * 1000;
@@ -92,6 +95,7 @@ interface RawMessage {
   created: number;
   completed?: number;
   modelID?: string;
+  speed?: string;
   providerID?: string;
   cwd?: string;
   input: number;
@@ -109,12 +113,14 @@ interface RawData {
   messages: Map<string, RawMessage>;
   /** session id -> tool call count */
   toolCalls: Map<string, number>;
+  /** session id -> tool name -> call count */
+  toolNames: Map<string, Map<string, number>>;
   /** dedupe key for tool parts (part id) */
   toolPartIds: Set<string>;
 }
 
 function newRaw(): RawData {
-  return { sessions: new Map(), messages: new Map(), toolCalls: new Map(), toolPartIds: new Set() };
+  return { sessions: new Map(), messages: new Map(), toolCalls: new Map(), toolNames: new Map(), toolPartIds: new Set() };
 }
 
 function addSession(raw: RawData, s: RawSession): void {
@@ -147,10 +153,15 @@ function addMessage(raw: RawData, m: RawMessage): void {
   raw.messages.set(m.id, m);
 }
 
-function addToolPart(raw: RawData, partId: string, sessionId: string): void {
+function addToolPart(raw: RawData, partId: string, sessionId: string, toolName?: unknown): void {
   if (raw.toolPartIds.has(partId)) return;
   raw.toolPartIds.add(partId);
   raw.toolCalls.set(sessionId, (raw.toolCalls.get(sessionId) ?? 0) + 1);
+  const name = toolCallName(toolName);
+  if (!name) return;
+  let tally = raw.toolNames.get(sessionId);
+  if (!tally) raw.toolNames.set(sessionId, (tally = new Map()));
+  countToolCall(tally, name);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -295,20 +306,22 @@ function readSqlite(db: Db, raw: RawData, warn: (m: string) => void, path: strin
       });
     }
 
-    const toolSql = `SELECT id, ${pCols.has('session_id') ? 'session_id' : 'NULL'} AS sid, message_id AS mid
+    // The tool's name only ($.tool, capped); the call's input and output ($.state) are never selected.
+    const toolSql = `SELECT id, ${pCols.has('session_id') ? 'session_id' : 'NULL'} AS sid, message_id AS mid,
+        CASE WHEN json_valid(data) THEN CASE WHEN json_type(data,'$.tool') = 'text' THEN substr(json_extract(data,'$.tool'),1,200) END END AS tool_name
       FROM part WHERE CASE WHEN json_valid(data) THEN json_extract(data,'$.type') END = 'tool'`;
     const toolRows = db.prepare(toolSql).all() as Array<Record<string, unknown>>;
     // session id may need resolving from message when part.session_id is absent
-    const pending: Array<{ id: string; mid: string }> = [];
+    const pending: Array<{ id: string; mid: string; name: unknown }> = [];
     for (const r of toolRows) {
-      if (str(r.sid)) addToolPart(raw, String(r.id), String(r.sid));
-      else pending.push({ id: String(r.id), mid: String(r.mid) });
+      if (str(r.sid)) addToolPart(raw, String(r.id), String(r.sid), r.tool_name);
+      else pending.push({ id: String(r.id), mid: String(r.mid), name: r.tool_name });
     }
     if (pending.length) {
       const look = db.prepare('SELECT session_id FROM message WHERE id = ?');
       for (const p of pending) {
         const row = look.get(p.mid) as { session_id?: string } | undefined;
-        if (row?.session_id) addToolPart(raw, p.id, row.session_id);
+        if (row?.session_id) addToolPart(raw, p.id, row.session_id, p.name);
       }
     }
   }
@@ -318,6 +331,8 @@ function readSqlite(db: Db, raw: RawData, warn: (m: string) => void, path: strin
       json_extract(data,'$.time.created') AS t_created,
       json_extract(data,'$.time.completed') AS t_completed,
       json_extract(data,'$.modelID') AS model_id,
+      json_extract(data,'$.speed') AS speed,
+      json_extract(data,'$.service_tier') AS service_tier,
       json_extract(data,'$.providerID') AS provider_id,
       json_extract(data,'$.path.cwd') AS cwd,
       json_extract(data,'$.tokens.input') AS input,
@@ -344,6 +359,7 @@ function readSqlite(db: Db, raw: RawData, warn: (m: string) => void, path: strin
       created: num(r.t_created) || num(r.time_created),
       completed: num(r.t_completed) || undefined,
       modelID: str(r.model_id),
+      speed: providerSpeed(str(r.model_id) ?? '', str(r.speed), str(r.service_tier)),
       providerID: str(r.provider_id),
       cwd: str(r.cwd),
       input: num(r.input),
@@ -414,7 +430,7 @@ function readLegacy(storage: string, raw: RawData): void {
       const cache = isObj(tokens.cache) ? tokens.cache : {};
       const path = isObj(d.path) ? d.path : {};
 
-      // parts: only type / tokens / cost are retained
+      // parts: only type / tool name / tokens / cost are retained
       let steps: StepAgg | undefined;
       const mpdir = join(partDir, id);
       for (const pf of listDir(mpdir)) {
@@ -422,7 +438,7 @@ function readLegacy(storage: string, raw: RawData): void {
         const p = readJson(join(mpdir, pf));
         if (!p) continue;
         if (p.type === 'tool') {
-          addToolPart(raw, str(p.id) ?? `${id}/${pf}`, str(p.sessionID) ?? sessionId);
+          addToolPart(raw, str(p.id) ?? `${id}/${pf}`, str(p.sessionID) ?? sessionId, p.tool);
         } else if (p.type === 'step-finish') {
           const t = isObj(p.tokens) ? p.tokens : {};
           const c = isObj(t.cache) ? t.cache : {};
@@ -444,6 +460,7 @@ function readLegacy(storage: string, raw: RawData): void {
         created: num(time.created),
         completed: num(time.completed) || undefined,
         modelID: str(d.modelID),
+        speed: providerSpeed(str(d.modelID) ?? '', str(d.speed), str(d.service_tier)),
         providerID: str(d.providerID),
         cwd: str(path.cwd) ?? str(path.root),
         input: num(tokens.input),
@@ -535,6 +552,7 @@ function build(raw: RawData, opts: LoadOptions): { events: UsageEvent[]; session
         project: project || (m.cwd ? normPath(m.cwd) : ''),
         model,
         provider: m.providerID,
+        ...(m.speed ? { speed: m.speed } : {}),
         inputTokens: input,
         outputTokens: output + reasoning,
         cacheReadTokens: cacheRead,
@@ -568,6 +586,8 @@ function build(raw: RawData, opts: LoadOptions): { events: UsageEvent[]; session
       turns: userMessages,
       models: [...models],
     };
+    const byName = toolCallsRecord(raw.toolNames.get(sid) ?? new Map());
+    if (byName) info.toolCallsByName = byName;
     if (s?.title) info.title = s.title;
     if (s?.version) info.version = s.version;
     if (opts.since !== undefined && endedAt < opts.since) continue;

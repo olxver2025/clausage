@@ -37,7 +37,11 @@ function parentRollout(): string {
     line('2026-10-01T10:00:02.000Z', 'turn_context', { turn_id: 't1', model: 'model-a', cwd: '/work/proj' }),
     line('2026-10-01T10:00:02.000Z', 'event_msg', { type: 'item_completed', item: { type: 'UserMessage', text: 'SECRET-PROMPT' } }),
     line('2026-10-01T10:00:03.000Z', 'response_item', { type: 'function_call', name: 'exec', call_id: 'c1', arguments: 'SECRET-ARGS' }),
-    line('2026-10-01T10:00:04.000Z', 'response_item', { type: 'custom_tool_call', name: 'exec', call_id: 'c2' }),
+    line('2026-10-01T10:00:04.000Z', 'response_item', { type: 'custom_tool_call', name: ' apply_patch ', call_id: 'c2', input: 'SECRET-PATCH' }),
+    line('2026-10-01T10:00:04.000Z', 'response_item', { type: 'function_call', namespace: 'mcp__github', name: 'create_pr', call_id: 'c3', arguments: 'SECRET-ARGS' }),
+    line('2026-10-01T10:00:04.000Z', 'response_item', { type: 'function_call', namespace: 'mcp__github', name: 'create_pr', call_id: 'c3', arguments: 'SECRET-ARGS' }),
+    line('2026-10-01T10:00:04.000Z', 'response_item', { type: 'local_shell_call', call_id: 'c4', action: { command: ['SECRET-CMD'] } }),
+    line('2026-10-01T10:00:04.000Z', 'response_item', { type: 'function_call', name: { not: 'a string' }, call_id: 'c5' }),
     line('2026-10-01T10:00:05.000Z', 'token_usage_record', { thread_id: PARENT, turn_id: 't1', response_id: 'r1', usage: U(1000, 800, 50, 10) }),
     line('2026-10-01T10:00:05.000Z', 'event_msg', { type: 'token_count', info: { total_token_usage: U(1000, 800, 50, 10), last_token_usage: U(1000, 800, 50, 10) } }),
     line('2026-10-01T10:00:06.000Z', 'event_msg', { type: 'item_completed', item: { type: 'AgentMessage', text: 'SECRET-ANSWER' } }),
@@ -159,7 +163,9 @@ test('codex parser: records, fork baseline, token_count fallback, sessions', asy
     assert.equal(ps.title, 'Parent title');
     assert.equal(ps.turns, 2);
     assert.equal(ps.activeMs, 10000);
-    assert.equal(ps.toolCalls, 2);
+    assert.equal(ps.toolCalls, 5);
+    // names only (trimmed; MCP namespace joined; unnamed built-ins by item type; non-strings ignored)
+    assert.deepEqual(ps.toolCallsByName, { apply_patch: 1, exec: 1, local_shell: 1, mcp__github__create_pr: 1 });
     assert.equal(ps.userMessages, 1);
     assert.equal(ps.assistantMessages, 1);
     assert.equal(ps.version, '0.166.0');
@@ -271,4 +277,16 @@ test('codex: thread resumed by a newer CLI counts the token_count-only segment o
   assert.equal(r.method, 'records');
   assert.equal(tokSum(r.events), 1050 + 2100);
   assert.deepEqual(r.events.map((e) => e.model).sort(), ['new', 'old']);
+});
+
+test('Codex retains tier changes, with response metadata overriding only its own request', () => {
+  const ts = '2026-11-15T10:00:00Z';
+  const settings = (tier?: string) => line(ts, 'event_msg', {
+    type: 'thread_settings_applied', thread_settings: { service_tier: tier },
+  });
+  const request = (service_tier?: string) => line(ts, 'token_usage_record', { usage: { ...U(5, 0, 1), service_tier } });
+  const raw = [line(ts, 'session_meta', { id: PARENT }), settings('priority'), request(),
+    settings('ultrafast'), request('default'), request(), settings(), request()].join('\n');
+  const result = parseCodexRolloutLines(parseRaw(raw), { seenResponseIds: new Set() });
+  assert.deepEqual(result.events.map((e) => e.speed), ['priority', 'default', 'ultrafast', undefined]);
 });

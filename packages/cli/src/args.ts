@@ -22,6 +22,10 @@ export const COMMANDS = [
   'summary',
   'pricing',
   'web',
+  'sync',
+  'statusline',
+  'export',
+  'mcp',
   'help',
 ] as const;
 export type Command = (typeof COMMANDS)[number];
@@ -37,10 +41,33 @@ const COMMAND_ALIASES: Record<string, Command> = {
   tool: 'tools',
   dashboard: 'summary',
   price: 'pricing',
+  status: 'statusline',
+  'status-line': 'statusline',
+  events: 'export',
+  'mcp-server': 'mcp',
 };
 
 const TOOL_ALIASES: Record<string, ToolId> = {
   claude: 'claude-code',
+  hermes: 'hermes',
+  'hermes-agent': 'hermes',
+  openclaw: 'openclaw',
+  clawdbot: 'openclaw',
+  moltbot: 'openclaw',
+  pi: 'pi',
+  'pi-agent': 'pi',
+  gemini: 'gemini',
+  'gemini-cli': 'gemini',
+  amp: 'amp',
+  ampcode: 'amp',
+  qwen: 'qwen',
+  'qwen-code': 'qwen',
+  qwencode: 'qwen',
+  copilot: 'copilot',
+  'copilot-cli': 'copilot',
+  'github-copilot': 'copilot',
+  ghcp: 'copilot',
+  aider: 'aider',
   'claude-code': 'claude-code',
   claudecode: 'claude-code',
   cc: 'claude-code',
@@ -58,7 +85,7 @@ export class UsageError extends Error {}
 
 export function parseTool(s: string): ToolId {
   const t = TOOL_ALIASES[s.trim().toLowerCase()];
-  if (!t) throw new UsageError(`Unknown tool "${s}". Use one of: claude, codex, grok, opencode`);
+  if (!t) throw new UsageError(`Unknown tool "${s}". Use one of: claude, codex, grok, opencode, hermes, openclaw, pi, gemini, amp, qwen, copilot, aider`);
   return t;
 }
 
@@ -108,7 +135,20 @@ export interface CliOptions {
   tokenLimit?: number | 'max';
   id?: string;
   port: number;
+  /** ignore other computers' synced usage */
+  local: boolean;
+  /** sync command: folder to set ('' or 'off' turns sync off) */
+  folder?: string;
+  /** sync command: rename this computer */
+  name?: string;
+  /** output format for reports and export (json = --json) */
+  format: OutputFormat;
+  /** statusline: seconds to reuse computed figures (0 = always recompute) */
+  cacheSeconds: number;
 }
+
+export const OUTPUT_FORMATS = ['table', 'json', 'csv', 'tsv', 'jsonl'] as const;
+export type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 
 export function parseCli(argv: string[]): CliOptions {
   const { values, positionals } = parseArgs({
@@ -129,6 +169,9 @@ export function parseCli(argv: string[]): CliOptions {
       compact: { type: 'boolean' },
       project: { type: 'string', short: 'p' },
       subagents: { type: 'boolean', default: true },
+      local: { type: 'boolean' },
+      folder: { type: 'string' },
+      name: { type: 'string' },
       path: { type: 'string', multiple: true },
       'refresh-pricing': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -142,6 +185,8 @@ export function parseCli(argv: string[]): CliOptions {
       'token-limit': { type: 'string' },
       id: { type: 'string' },
       port: { type: 'string', short: 'P' },
+      format: { type: 'string', short: 'f' },
+      cache: { type: 'string' },
     },
   });
 
@@ -216,6 +261,14 @@ export function parseCli(argv: string[]): CliOptions {
   const port = values.port === undefined ? 3456 : Number(values.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError('--port must be a port number (1-65535)');
 
+  let format = (values.format ?? (values.json ? 'json' : 'table')).toLowerCase() as OutputFormat;
+  if (!OUTPUT_FORMATS.includes(format)) throw new UsageError(`--format must be one of ${OUTPUT_FORMATS.join(', ')}`);
+  if (values.json && values.format && format !== 'json') throw new UsageError('--json and --format disagree; use one');
+  if (command === 'export' && format === 'table') format = 'csv';
+
+  const cacheSeconds = values.cache === undefined ? 30 : Number(values.cache);
+  if (!Number.isFinite(cacheSeconds) || cacheSeconds < 0) throw new UsageError('--cache expects seconds (0 or more)');
+
   const tools = parseTools(values.tool);
   if (tools) for (const t of tools) if (!TOOL_IDS.includes(t)) throw new UsageError(`Unknown tool ${t}`);
 
@@ -227,7 +280,9 @@ export function parseCli(argv: string[]): CliOptions {
     since: sinceDate ? startOfDay(sinceDate, timezone) : undefined,
     until: untilDate ? endOfDay(untilDate, timezone) : undefined,
     tools,
-    json: Boolean(values.json),
+    json: format === 'json',
+    format,
+    cacheSeconds,
     breakdown: Boolean(values.breakdown),
     mode,
     offline: Boolean(values.offline),
@@ -249,5 +304,8 @@ export function parseCli(argv: string[]): CliOptions {
     tokenLimit,
     id: values.id,
     port,
+    local: Boolean(values.local),
+    folder: values.folder,
+    name: values.name,
   };
 }

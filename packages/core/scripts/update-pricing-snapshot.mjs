@@ -10,7 +10,7 @@ const URL_ = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_price
 const out = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'pricing-snapshot.json');
 
 const PRICE_FIELD =
-  /^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|cache_creation_input_token_cost)(_above_1hr)?(_above_\d+k_tokens)?(_priority|_flex)?$/;
+  /^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|cache_creation_input_token_cost)(_above_1hr)?(_above_\d+k_tokens)?(_priority|_ultrafast|_flex)?$/;
 const PROVIDERS = new Set(['anthropic', 'openai', 'xai', 'deepseek', 'gemini', 'mistral', 'groq', 'dashscope', 'moonshot', 'zai']);
 const OPENROUTER_RE = /claude|gpt|grok|glm|deepseek|qwen|kimi/;
 
@@ -19,6 +19,7 @@ function keep(key, v) {
   if (v.mode !== 'chat' && v.mode !== 'responses') return false;
   if (typeof v.input_cost_per_token !== 'number') return false;
   const p = v.litellm_provider;
+  if (p === 'azure_ai' && /^azure_ai\/claude-(?:opus-5-5|mythos-5-2|fable-5-2)-fast$/.test(key)) return true;
   if (PROVIDERS.has(p)) return true;
   if (p === 'vertex_ai-language-models') return /gemini/.test(key);
   if (p === 'openrouter') return OPENROUTER_RE.test(key);

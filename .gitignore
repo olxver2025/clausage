@@ -3,3 +3,11 @@ dist/
 .next/
 *.tsbuildinfo
 .env*
+
+# Personal usage data clausage can write: exports and sync snapshots
+*.clausage.enc
+*.clausage.json.gz
+*.csv
+*.tsv
+/exports/
+**/.claude/.cc-writes/

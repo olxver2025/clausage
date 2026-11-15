@@ -64,8 +64,8 @@ test('aliases and family fallbacks', () => {
   assert.equal(table.lookup('codex-auto-review', 'codex', undefined, Date.UTC(2026, 6, 30))!.key, 'gpt-5.6-luna');
   assert.equal(table.lookup('gpt-reserve')!.key, 'gpt-5.6-luna');
   assert.equal(table.lookup('', 'codex')!.key, 'gpt-5');
-  assert.equal(table.resolve('claude-opus-5-5-fast')!.pricing.key, 'claude-opus-5-5');
-  assert.equal(table.resolve('claude-opus-5-5-fast')!.match, 'shortened');
+  assert.equal(table.resolve('claude-opus-5-5-fast')!.pricing.key, 'azure_ai/claude-opus-5-5-fast');
+  assert.equal(table.resolve('claude-opus-5-5-fast')!.match, 'prefixed');
   const fam = table.resolve('claude-opus-9')!;
   assert.equal(fam.match, 'family');
   assert.match(fam.pricing.key, /^claude-opus-\d/);
@@ -229,9 +229,37 @@ test('service tiers: Codex priority (Fast) and flex use *_priority / *_flex rate
   // priority + long context: *_above_272k_tokens_priority
   close(costForEvent(ev({ ...base, cacheReadTokens: 300_000, speed: 'priority' }), luna),
     1000 * 0.4 * M + 300_000 * 0.04 * M + 100 * 1.5 * M);
-  // models without variants (Claude) ignore speed
+  // Claude reports the delivered speed separately from its capacity tier.
   const opus = table.lookup('claude-opus-5-5')!;
   const c = { tool: 'claude-code' as const, model: 'claude-opus-5-5', inputTokens: 10, outputTokens: 10 };
-  close(costForEvent(ev({ ...c, speed: 'fast' }), opus), costForEvent(ev(c), opus));
+  close(costForEvent(ev({ ...c, speed: 'fast' }), opus), 10 * (8 + 40) * M);
   close(costForEvent(ev({ ...c, speed: 'standard' }), opus), costForEvent(ev(c), opus));
+});
+
+test('Ultrafast uses model-specific input, output, cache and long-context rates offline', () => {
+  for (const [model, input, output, read, write] of [
+    ['gpt-6.1-sol', 12, 60, 0.6, 15], ['gpt-6-astra', 60, 300, 6, 75],
+  ] as const) {
+    const event = ev({ tool: 'codex', model, speed: 'ultrafast', inputTokens: 100, outputTokens: 10, cacheReadTokens: 20, cacheWriteTokens: 5 });
+    const price = table.lookup(model, 'codex')!;
+    close(costForEvent(event, price), (100 * input + 10 * output + 20 * read + 5 * write) * M);
+    close(costForEvent({ ...event, inputTokens: 272001 }, price),
+      (272001 * input * 2 + 10 * output * 1.5 + 20 * read * 2 + 5 * write * 2) * M);
+  }
+});
+
+test('Claude Fast applies cache pricing once, including on a dedicated Fast deployment', () => {
+  for (const model of ['claude-opus-5-5', 'claude-opus-5-5-fast']) {
+    const e = ev({ tool: 'claude-code', model, speed: 'fast', inputTokens: 10, outputTokens: 20,
+      cacheReadTokens: 300000, cacheWriteTokens: 15, cacheWrite1hTokens: 5 });
+    applyCosts([e], table, 'calculate');
+    close(e.costUSD, (10 * 8 + 20 * 40 + 300000 * 0.4 + 10 * 10 + 5 * 16) * M);
+  }
+});
+
+test('missing premium prices respect recorded cost or flag the cost as unknown', () => {
+  const e = ev({ tool: 'codex', model: 'gpt-6-luna', speed: 'ultrafast', inputTokens: 1000 });
+  const recorded = { ...e, recordedCostUSD: 1.25 };
+  applyCosts([e, recorded], table, 'calculate');
+  assert.deepEqual([e.costUSD, e.costUnknown, recorded.costUSD, recorded.costUnknown], [0, true, 1.25, false]);
 });

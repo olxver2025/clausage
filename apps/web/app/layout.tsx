@@ -8,7 +8,7 @@ import { FilterBar, FilterBarFallback } from "@/components/shell/FilterBar";
 import { NavigationProvider, PendingRegion } from "@/components/shell/navigation";
 import { NavLinks, NavLinksFallback } from "@/components/shell/NavLinks";
 import { SourcesFooter, SourcesFooterFallback } from "@/components/shell/SourcesFooter";
-import { ThemeToggle } from "@/components/shell/ThemeToggle";
+import { LiveStatusLink, LiveUpdater } from "@/components/shell/LiveUpdater";
 import "./globals.css";
 
 const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
@@ -37,19 +37,16 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
             </a>
             <div className="app-shell">
               <aside className="app-sidebar">
-                <div className="flex items-center justify-between gap-3 lg:block">
-                  <Link href="/" className="brand">
-                    clausage
-                  </Link>
-                  <ThemeToggle className="lg:hidden" />
-                </div>
+                <Link href="/" className="brand">
+                  clausage
+                </Link>
                 <nav aria-label="Main" className="app-nav">
                   <Suspense fallback={<NavLinksFallback />}>
                     <NavLinks />
                   </Suspense>
                 </nav>
                 <div className="mt-auto hidden lg:block">
-                  <ThemeToggle />
+                  <LiveStatusLink />
                 </div>
               </aside>
               <div className="app-main">
@@ -70,6 +67,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
                 </footer>
               </div>
             </div>
+            <LiveUpdater />
             <Suspense fallback={null}>
               <AgentBridge />
             </Suspense>

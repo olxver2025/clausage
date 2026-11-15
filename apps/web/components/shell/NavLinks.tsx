@@ -11,6 +11,7 @@ export const NAV_ITEMS = [
   { href: "/models", label: "Models" },
   { href: "/projects", label: "Projects" },
   { href: "/blocks", label: "Blocks & limits" },
+  { href: "/settings", label: "Settings" },
 ] as const;
 
 function isActive(pathname: string, href: string) {

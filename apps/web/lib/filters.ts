@@ -40,6 +40,8 @@ export interface Filters {
   mode: CostMode;
   group: Group;
   project?: string;
+  /** computers to include (by name); empty for all */
+  machines: string[];
   subagents: boolean;
   fresh: boolean;
 }
@@ -151,6 +153,7 @@ export function parseFilters(src: ParamSource, now?: number): Filters {
     mode,
     group,
     project,
+    machines: (first(src, "machines") ?? "").split(",").map((m) => m.trim()).filter(Boolean),
     subagents: !(sub === "0" || sub === "false"),
     fresh: fresh === "1" || fresh === "true",
   };
@@ -165,6 +168,7 @@ export type FilterPatch = Partial<{
   mode: CostMode | null;
   group: Group | null;
   project: string | null;
+  machines: string[] | null;
   subagents: boolean | null;
 }>;
 
@@ -196,6 +200,7 @@ export function applyFilterPatch(current: URLSearchParams, patch: FilterPatch): 
   if ("mode" in patch) set("mode", patch.mode === "auto" ? null : patch.mode);
   if ("group" in patch) set("group", patch.group === "daily" ? null : patch.group);
   if ("project" in patch) set("project", patch.project);
+  if ("machines" in patch) set("machines", patch.machines?.length ? patch.machines.join(",") : null);
   if ("subagents" in patch) set("subagents", patch.subagents === false ? "0" : null);
   return next;
 }
@@ -215,6 +220,7 @@ export function filtersToQuery(f: Filters, extra: Record<string, string> = {}): 
   if (f.mode !== "auto") p.set("mode", f.mode);
   if (f.group !== "daily") p.set("group", f.group);
   if (f.project) p.set("project", f.project);
+  if (f.machines?.length) p.set("machines", f.machines.join(","));
   if (!f.subagents) p.set("subagents", "0");
   for (const [k, v] of Object.entries(extra)) p.set(k, v);
   const s = p.toString();

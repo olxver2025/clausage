@@ -1,5 +1,7 @@
 import { ToolDot } from "@/components/charts/Legend";
-import { formatCost, formatDayKey, formatDuration, formatNumber, formatRelative, formatTokens } from "@/lib/format";
+import { Ticker } from "@/components/charts/Ticker";
+import type { ValueFormat } from "@/lib/format";
+import { formatDayKey, formatRelative } from "@/lib/format";
 import { TOOL_SHORT_LABELS, TOOL_LABELS } from "@/lib/tools";
 import type { DayStats } from "./stats";
 
@@ -15,11 +17,11 @@ export function TodayStrip({ day, stats, now }: { day: string; stats: DayStats; 
       ) : (
         <>
           <dl className="flex flex-wrap items-baseline gap-x-5 gap-y-1">
-            <Item label="Cost" value={formatCost(stats.costUSD)} />
-            <Item label="Tokens" value={formatTokens(stats.totalTokens)} />
-            <Item label="Sessions" value={formatNumber(stats.sessions)} />
-            <Item label="Active" value={formatDuration(stats.activeMs)} />
-            {stats.lastAt !== undefined && <Item label="Last request" value={formatRelative(stats.lastAt, now)} plain />}
+            <Item label="Cost" value={stats.costUSD} format="cost" />
+            <Item label="Tokens" value={stats.totalTokens} format="tokens" />
+            <Item label="Sessions" value={stats.sessions} format="number" />
+            <Item label="Active" value={stats.activeMs} format="duration" />
+            {stats.lastAt !== undefined && <TextItem label="Last request" value={formatRelative(stats.lastAt, now)} />}
           </dl>
           <ul aria-label="Today's cost by tool" className="flex flex-wrap items-center gap-x-4 gap-y-1 sm:ms-auto">
             {stats.byTool.map((t) => (
@@ -29,7 +31,7 @@ export function TodayStrip({ day, stats, now }: { day: string; stats: DayStats; 
                 <span aria-hidden="true" className="text-fg-2">
                   {TOOL_SHORT_LABELS[t.tool]}
                 </span>
-                <span className="tabular font-medium text-fg">{formatCost(t.costUSD)}</span>
+                <Ticker value={t.costUSD} format="cost" className="font-medium text-fg" />
               </li>
             ))}
           </ul>
@@ -39,11 +41,22 @@ export function TodayStrip({ day, stats, now }: { day: string; stats: DayStats; 
   );
 }
 
-function Item({ label, value, plain }: { label: string; value: string; plain?: boolean }) {
+function Item({ label, value, format }: { label: string; value: number; format: ValueFormat }) {
   return (
     <div className="flex items-baseline gap-1.5">
       <dt className="text-fg-3">{label}</dt>
-      <dd className={`${plain ? "" : "tabular"} font-medium text-fg`}>{value}</dd>
+      <dd className="font-medium text-fg">
+        <Ticker value={value} format={format} />
+      </dd>
+    </div>
+  );
+}
+
+function TextItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline gap-1.5">
+      <dt className="text-fg-3">{label}</dt>
+      <dd className="font-medium text-fg">{value}</dd>
     </div>
   );
 }

@@ -1,6 +1,6 @@
-import { buildReport, type SessionMeta } from '@clausage/core';
+import { buildReport, toolCallStats, type SessionMeta, type UsageRow } from '@clausage/core';
 import type { CliOptions } from '../args.js';
-import { loadData, noData, printJson, printWarnings } from '../context.js';
+import { loadData, noData, printDelimitedReport, printJson, printWarnings } from '../context.js';
 import {
   c,
   fmtDateTime,
@@ -20,6 +20,37 @@ import { Table, type Column } from '../table.js';
 function shortId(id: string): string {
   const clean = id.replace(/-/g, '');
   return clean.length > 8 ? clean.slice(-8) : clean;
+}
+
+/** Tool names come from log files: strip control characters before they reach the terminal. */
+function safeName(name: string): string {
+  return name.replace(/[\u0000-\u001f\u007f-\u009f]/g, '?');
+}
+
+const TOOL_CALL_ROWS = 15;
+
+/** Calls per tool name for one session (root plus folded subagents). Names only. */
+function renderToolCalls(row: UsageRow): string {
+  const m = row.meta as unknown as SessionMeta;
+  const total = m.toolCalls || 0;
+  const head = ` ${c.bold('Tool calls')} `;
+  if (!total) return `${head}${c.dim('none recorded')}\n`;
+  const stats = toolCallStats([m]);
+  const perCall = row.costUSD > 0 ? c.dim(`, ${fmtUSD(row.costUSD / total)} per call`) : '';
+  const out = `${head}${c.dim(`(${fmtInt(total)} calls`)}${perCall}${c.dim(')')}\n`;
+  if (!stats.length) return out + ` ${c.dim("this tool's logs do not record tool names")}\n`;
+  const table = new Table([{ header: 'Tool', maxWidth: 60 }, { header: 'Calls', align: 'right' }, { header: 'Share', align: 'right' }]);
+  for (const st of stats.slice(0, TOOL_CALL_ROWS)) {
+    table.push([safeName(st.name), fmtInt(st.calls), `${((st.calls / total) * 100).toFixed(1)}%`]);
+  }
+  const rest = stats.slice(TOOL_CALL_ROWS);
+  if (rest.length) {
+    const calls = rest.reduce((a, st) => a + st.calls, 0);
+    table.push([c.dim(`${rest.length} more`), c.dim(fmtInt(calls)), c.dim(`${((calls / total) * 100).toFixed(1)}%`)]);
+  }
+  const named = stats.reduce((a, st) => a + st.calls, 0);
+  if (named < total) table.push([c.dim('(unnamed)'), c.dim(fmtInt(total - named)), c.dim(`${(((total - named) / total) * 100).toFixed(1)}%`)]);
+  return out + '\n' + table.render() + '\n';
 }
 
 export async function runSession(opts: CliOptions): Promise<void> {
@@ -43,6 +74,7 @@ export async function runSession(opts: CliOptions): Promise<void> {
   });
   report.warnings = data.uniqueWarnings;
   if (opts.json) return printJson(report);
+  if (printDelimitedReport(report, opts)) return;
   printWarnings(data.uniqueWarnings, opts);
   if (!report.rows.length) return noData(opts, 'sessions');
 
@@ -70,7 +102,7 @@ export async function runSession(opts: CliOptions): Promise<void> {
     const models = [...new Set(r.models.map(shortModel))];
     table.push([
       sid,
-      toolName(m.tool),
+      [toolName(m.tool), ...new Set(r.breakdown.map((b) => b.speed).filter((s) => s === 'fast' || s === 'ultrafast'))].join(' · '),
       ...(compact ? [] : [shortProject(m.project)]),
       title,
       fmtDateTime(m.endedAt, report.timezone),
@@ -97,4 +129,5 @@ export async function runSession(opts: CliOptions): Promise<void> {
   const scope = opts.tools ? opts.tools.map((t) => toolName(t)).join(', ') : 'all tools';
   process.stdout.write(`\n ${c.bold('Sessions')} ${c.dim(`(${scope}, ${report.timezone}; +N = subagents)`)}\n\n`);
   process.stdout.write(table.render() + '\n');
+  if (opts.id && report.rows.length === 1) process.stdout.write('\n' + renderToolCalls(report.rows[0]!));
 }

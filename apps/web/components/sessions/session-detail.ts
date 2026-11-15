@@ -1,5 +1,5 @@
 import "server-only";
-import { buildReport, computeActiveMs, sumTotals, type ModelBreakdown, type SessionMeta, type TokenTotals, type ToolId, type UsageEvent } from "@clausage/core";
+import { buildReport, usageSpeed, computeActiveMs, sumTotals, type ModelBreakdown, type SessionMeta, type TokenTotals, type ToolId, type UsageEvent } from "@clausage/core";
 import { getUsage, type Filters } from "@/lib/data";
 import { displayTitle } from "./links";
 
@@ -12,6 +12,7 @@ export interface SubagentRow extends TokenTotals {
   turns: number;
   toolCalls: number;
   models: string[];
+  speeds: string[];
 }
 
 export interface SessionDetail {
@@ -67,6 +68,7 @@ export async function getSessionDetail(filters: Filters, tool: ToolId, rootId: s
       turns: info?.turns ?? 0,
       toolCalls: info?.toolCalls ?? 0,
       models: [...models].sort(),
+      speeds: [...new Set(list.flatMap((e) => usageSpeed(e.model, e.speed) ?? []))].sort(),
     };
   });
   subagents.sort((a, b) => a.startedAt - b.startedAt);
