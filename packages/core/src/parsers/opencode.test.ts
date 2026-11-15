@@ -152,9 +152,11 @@ test('opencode parser: sqlite + legacy, dedupe, subagents, step-finish, privacy'
     assert.equal(root.userMessages, 1);
     assert.equal(root.assistantMessages, 2); // incl. errored
     assert.equal(root.toolCalls, 2);
+    assert.deepEqual(root.toolCallsByName, { bash: 1, read: 1 });
     assert.equal(root.version, '1.18.25');
     assert.ok(root.activeMs > 0);
     assert.equal(r.sessions.find((s) => s.sessionId === 'ses_legacy')!.toolCalls, 1);
+    assert.deepEqual(r.sessions.find((s) => s.sessionId === 'ses_legacy')!.toolCallsByName, { edit: 1 });
 
     const blob = JSON.stringify(r);
     assert.ok(!blob.includes('SHOULD-NEVER-BE-READ'));
@@ -221,6 +223,7 @@ test('opencode parser: a malformed JSON row does not drop the whole database', a
     assert.equal(r.events.length, 1);
     assert.equal(r.events[0]!.inputTokens, 100);
     assert.equal(r.sessions[0]!.toolCalls, 1);
+    assert.deepEqual(r.sessions[0]!.toolCallsByName, { bash: 1 });
     assert.ok(warns.some((w) => /malformed JSON/.test(w)));
   } finally {
     rmSync(dir, { recursive: true, force: true });

@@ -70,12 +70,22 @@ describe("FilterBar", () => {
   test("Space on each tool toggle removes that tool from ?tools", async () => {
     const user = userEvent.setup();
     renderBar();
-    const expected: Record<string, string> = {
-      "Claude Code": "codex,grok,opencode",
-      Codex: "claude-code,grok,opencode",
-      "Grok Build": "claude-code,codex,opencode",
-      OpenCode: "claude-code,codex,grok",
+    const all = ["claude-code", "codex", "grok", "opencode", "hermes", "openclaw", "pi", "gemini", "amp", "qwen", "copilot", "aider"];
+    const names: Record<string, string> = {
+      "Claude Code": "claude-code",
+      Codex: "codex",
+      "Grok Build": "grok",
+      OpenCode: "opencode",
+      "Hermes Agent": "hermes",
+      OpenClaw: "openclaw",
+      Pi: "pi",
+      "Gemini CLI": "gemini",
+      Amp: "amp",
+      "Qwen Code": "qwen",
+      "Copilot CLI": "copilot",
+      Aider: "aider",
     };
+    const expected = Object.fromEntries(Object.entries(names).map(([name, id]) => [name, all.filter((t) => t !== id).join(",")]));
     for (const [name, tools] of Object.entries(expected)) {
       nav.reset();
       const { unmount } = render(
@@ -136,7 +146,7 @@ describe("FilterBar", () => {
     const q = lastQuery();
     expect(q.get("range")).toBe("90d");
     expect(q.get("mode")).toBe("calculate");
-    expect(q.get("tools")).toBe("claude-code,codex,grok");
+    expect(q.get("tools")).toBe("claude-code,codex,grok,hermes,openclaw,pi,gemini,amp,qwen,copilot,aider");
 
     const refresh = await agent.act({ steps: [{ ref: "Refresh", action: "press" }] });
     expect(refresh.ok, refresh.error?.message).toBe(true);

@@ -1,0 +1,154 @@
+@layer components {
+  .settings-layout {
+    display: grid;
+    gap: 1.5rem;
+    max-width: 60rem;
+  }
+  @media (min-width: 64rem) {
+    .settings-layout {
+      grid-template-columns: 10rem minmax(0, 1fr);
+      gap: 2.5rem;
+    }
+  }
+
+  .settings-index {
+    display: none;
+  }
+  @media (min-width: 64rem) {
+    .settings-index {
+      position: sticky;
+      top: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.125rem;
+      align-self: start;
+      font-size: 0.8125rem;
+    }
+  }
+  .settings-index a {
+    padding: 0.375rem 0.625rem;
+    border-radius: var(--radius);
+    color: var(--text-2);
+    text-decoration: none;
+  }
+  .settings-index a:hover {
+    background: var(--surface-hover);
+    color: var(--text);
+  }
+
+  .settings-sections {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+    min-width: 0;
+  }
+
+  .settings-section {
+    scroll-margin-top: 1rem;
+  }
+  .settings-section > header {
+    margin-bottom: 0.625rem;
+  }
+
+  /* one card per section; rows separated by hairlines */
+  .settings-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+  .settings-card > * + * {
+    border-top: 1px solid var(--border);
+  }
+
+  .setting-row {
+    display: grid;
+    gap: 0.625rem 2rem;
+    padding: 0.875rem 1rem;
+  }
+  @media (min-width: 40rem) {
+    .setting-row {
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+    }
+  }
+
+  .setting-row[data-stacked] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-note {
+    padding: 0.625rem 1rem;
+    font-size: 0.75rem;
+  }
+
+  .machine-list > li,
+  .tool-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.25rem 1rem;
+    padding: 0.75rem 1rem;
+    font-size: 0.8125rem;
+  }
+  .machine-list > li + li,
+  .tool-row + .tool-row {
+    border-top: 1px solid var(--border);
+  }
+
+  .tool-grid {
+    display: grid;
+  }
+  @media (min-width: 48rem) {
+    .tool-grid {
+      grid-template-columns: 1fr 1fr;
+    }
+    .tool-grid > .tool-row {
+      border-top: 1px solid var(--border);
+    }
+    .tool-grid > .tool-row:nth-child(-n + 2) {
+      border-top: 0;
+    }
+    .tool-grid > .tool-row:nth-child(odd) {
+      border-right: 1px solid var(--border);
+    }
+  }
+  .tool-row {
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: flex-start;
+  }
+  .tool-row:not([data-found]) {
+    color: var(--text-3);
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    font-size: 0.75rem;
+    color: var(--text-3);
+  }
+  .status-pill::before {
+    content: "";
+    width: 0.375rem;
+    height: 0.375rem;
+    border-radius: 999px;
+    background: var(--border-strong);
+  }
+  .status-pill[data-tone="good"] {
+    color: var(--text-2);
+  }
+  .status-pill[data-tone="good"]::before {
+    background: var(--good);
+  }
+
+  .button-primary {
+    border-color: var(--text);
+    background: var(--text);
+    color: var(--surface);
+  }
+  .button-primary:hover {
+    background: color-mix(in oklab, var(--text), var(--surface) 15%);
+  }
+}

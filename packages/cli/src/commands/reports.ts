@@ -5,7 +5,7 @@ import {
   type UsageRow,
 } from '@clausage/core';
 import type { CliOptions } from '../args.js';
-import { loadData, noData, printJson, printWarnings } from '../context.js';
+import { loadData, noData, printDelimitedReport, printJson, printWarnings } from '../context.js';
 import { c, fmtInt, fmtUSD, shortModel, terminalWidth, toolName, truncate, truncateStart } from '../format.js';
 import { Table, type Column } from '../table.js';
 
@@ -99,10 +99,10 @@ function buildTable(kind: PeriodKind, report: Report, layout: Layout, breakdown:
   for (const row of report.rows) {
     const tools = row.tools.map((t) => toolName(t)).join('\n');
     table.push(layout.cells(keyCell(kind, row), tools, modelsCell(row.models), row));
-    if (breakdown && row.breakdown.length > 1) {
+    if (breakdown && (row.breakdown.length > 1 || row.breakdown.some((b) => b.speed))) {
       for (const b of row.breakdown) {
         const label = kind === 'models' ? `  └─ ${toolName(b.tool)}` : `  └─ ${shortModel(b.model)}`;
-        table.push(layout.cells(label, kind === 'models' ? '' : toolName(b.tool), '', b), { style: c.dim });
+        table.push(layout.cells(b.speed ? `${label} · ${b.speed}` : label, kind === 'models' ? '' : toolName(b.tool), '', b), { style: c.dim });
       }
     }
   }
@@ -144,6 +144,7 @@ export async function runPeriodReport(kind: PeriodKind, opts: CliOptions): Promi
   });
   report.warnings = data.uniqueWarnings;
   if (opts.json) return printJson(report);
+  if (printDelimitedReport(report, opts)) return;
   printWarnings(data.uniqueWarnings, opts);
   if (!report.rows.length) return noData(opts);
   const scope = opts.tools ? opts.tools.map((t) => toolName(t)).join(', ') : 'all tools';

@@ -1,4 +1,5 @@
 import type { ToolId } from "@clausage/core";
+import { ToolIcon } from "@/components/icons/BrandIcon";
 import { TOOL_LABELS, toolColor } from "@/lib/tools";
 
 export interface LegendProps {
@@ -22,8 +23,10 @@ export function Legend({ tools, shape = "bar", className = "" }: LegendProps) {
   );
 }
 
+/** The tool's mark in its chart colour ("line" draws the line-chart key instead). */
 export function ToolDot({ tool, shape = "bar" }: { tool: ToolId; shape?: "bar" | "line" }) {
-  return <span aria-hidden="true" className={shape === "line" ? "tool-line-key" : "tool-swatch"} style={{ "--swatch": toolColor(tool) } as React.CSSProperties} />;
+  if (shape === "line") return <span aria-hidden="true" className="tool-line-key" style={{ "--swatch": toolColor(tool) } as React.CSSProperties} />;
+  return <ToolIcon tool={tool} size="0.875rem" />;
 }
 
 export function ToolName({ tool }: { tool: ToolId }) {

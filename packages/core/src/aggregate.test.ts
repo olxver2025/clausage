@@ -5,8 +5,12 @@ import {
   buildBlocks,
   dateKey,
   endOfDay,
+  mcpServerOf,
+  mcpServerStats,
+  mergeToolCallsByName,
   startOfDay,
   sumTotals,
+  toolCallStats,
   weekKey,
   weekKeyFromDate,
   type BlockMeta,
@@ -196,6 +200,7 @@ test('session report groups subagents under root session', () => {
       rootSessionId: 'root',
       isSubagent: false,
       title: 'Hello',
+      toolCallsByName: { Bash: 3, Read: 1 },
       startedAt: Date.parse('2026-05-01T09:59:00Z'),
       endedAt: Date.parse('2026-05-01T10:06:00Z'),
       activeMs: 60_000,
@@ -206,6 +211,7 @@ test('session report groups subagents under root session', () => {
       rootSessionId: 'root',
       isSubagent: true,
       userMessages: 0,
+      toolCallsByName: { Bash: 2, mcp__github__create_pr: 2 },
       startedAt: Date.parse('2026-05-01T10:04:00Z'),
       endedAt: Date.parse('2026-05-01T10:05:00Z'),
       activeMs: 1000,
@@ -219,6 +225,8 @@ test('session report groups subagents under root session', () => {
   assert.equal(root.events, 2);
   assert.equal(meta.subagents, 1);
   assert.equal(meta.toolCalls, 8);
+  // subagent calls are folded into the root row too
+  assert.deepEqual(meta.toolCallsByName, { Bash: 5, Read: 1, mcp__github__create_pr: 2 });
   assert.equal(meta.userMessages, 2);
   assert.equal(meta.title, 'Hello');
   // max(root's own 60s, idle-gap estimate over all requests in the tree: 10:00 -> 10:05 = 5 min)
@@ -226,6 +234,38 @@ test('session report groups subagents under root session', () => {
   assert.equal(meta.startedAt, Date.parse('2026-05-01T09:59:00Z'));
   const other = r.rows[0]!.meta as unknown as SessionMeta;
   assert.equal(other.activeMs, 0);
+  assert.equal(other.toolCallsByName, undefined);
+  assert.ok(!('toolCallsByName' in other));
+});
+
+test('tool call stats: per name across sessions, MCP servers', () => {
+  const sessions: Array<{ toolCallsByName?: Record<string, number> }> = [
+    { toolCallsByName: { Bash: 4, Read: 2, mcp__github__create_pr: 1, 'mcp__claude-in-chrome__navigate': 2 } },
+    { toolCallsByName: { Bash: 1, Edit: 2, mcp__github__list_issues: 3, mcp__github__create_pr: 1 } },
+    { toolCallsByName: { Zero: 0 } },
+    {},
+  ];
+  assert.deepEqual(toolCallStats(sessions), [
+    { name: 'Bash', calls: 5, sessions: 2 },
+    { name: 'mcp__github__list_issues', calls: 3, sessions: 1 },
+    { name: 'Edit', calls: 2, sessions: 1 },
+    { name: 'Read', calls: 2, sessions: 1 },
+    { name: 'mcp__claude-in-chrome__navigate', calls: 2, sessions: 1 },
+    { name: 'mcp__github__create_pr', calls: 2, sessions: 2 },
+  ]);
+  assert.deepEqual(toolCallStats([]), []);
+  assert.equal(mcpServerOf('mcp__github__create_pr'), 'github');
+  assert.equal(mcpServerOf('mcp__claude-in-chrome__computer'), 'claude-in-chrome');
+  assert.equal(mcpServerOf('mcp__solo'), 'solo');
+  assert.equal(mcpServerOf('mcp__'), undefined);
+  assert.equal(mcpServerOf('Bash'), undefined);
+  assert.deepEqual(mcpServerStats(sessions), [
+    { server: 'github', calls: 5, tools: 2, sessions: 2 },
+    { server: 'claude-in-chrome', calls: 2, tools: 1, sessions: 1 },
+  ]);
+  assert.equal(mergeToolCallsByName([{}, { toolCallsByName: {} }]), undefined);
+  // names that are also Object.prototype keys are plain counts
+  assert.deepEqual(mergeToolCallsByName([{ toolCallsByName: { constructor: 1 } }, { toolCallsByName: { constructor: 2 } }]), { constructor: 3 });
 });
 
 test('sumTotals mixes events and totals', () => {
@@ -272,4 +312,13 @@ test('day boundaries when local midnight falls in a DST gap', () => {
   assert.equal(new Date(startOfDay('2026-10-25', 'Europe/London')).toISOString(), '2026-10-24T23:00:00.000Z');
   assert.equal(new Date(endOfDay('20261025', 'Europe/London')).toISOString(), '2026-10-25T23:59:59.999Z');
   assert.equal(new Date(endOfDay('2026-03-29', 'Europe/London')).toISOString(), '2026-03-29T22:59:59.999Z');
+});
+
+test('model breakdowns keep Fast, Ultrafast, confirmed standard and unreported usage separate', () => {
+  const events = ['fast', 'priority', 'ultrafast', 'default', undefined].map((speed) =>
+    ev('2026-11-15T10:00:00Z', { model: 'gpt-6-astra', tool: 'codex', speed }));
+  const report = buildReport('models', events, []);
+  assert.deepEqual(Object.fromEntries(report.rows[0]!.breakdown.map((b) => [b.speed ?? 'unreported', b.events])),
+    { fast: 2, ultrafast: 1, standard: 1, unreported: 1 });
+  assert.equal(report.totals.costUSD, 2.5);
 });

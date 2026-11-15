@@ -8,7 +8,8 @@
  *
  * PRIVACY: only metadata and numbers are extracted. prompt_history.jsonl, chat_history.jsonl,
  * config.toml and auth.json are never read. The only text kept is summary.json's
- * generated_title (as the session title).
+ * generated_title (as the session title) and each tool call's tool name (never its title,
+ * input or output).
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -21,6 +22,7 @@ import type {
   ToolParser,
   UsageEvent,
 } from '../types.js';
+import { countToolCall, toolCallName, toolCallsRecord } from './util.js';
 
 const TOOL = 'grok' as const;
 const PROVIDER = 'xai';
@@ -264,6 +266,8 @@ interface ScannedSession {
   timestamps: number[];
   promptIndexes: Set<number | string>;
   toolCallIds: Set<string>;
+  /** tool name per toolCallId (from `update._meta["x.ai/tool"].name`; names only) */
+  toolCallNames: Map<string, string>;
   chunkModels: string[];
   turnDurations: number[];
   hasUpdates: boolean;
@@ -317,6 +321,7 @@ async function scanSession(dir: string, dirName: string, cwdFallback: string): P
     timestamps: [],
     promptIndexes: new Set(),
     toolCallIds: new Set(),
+    toolCallNames: new Map(),
     chunkModels: [],
     turnDurations: [],
     hasUpdates: false,
@@ -357,7 +362,12 @@ async function scanSession(dir: string, dirName: string, cwdFallback: string): P
         if (mid) s.chunkModels.push(mid);
       } else if (kind === 'tool_call') {
         const id = str(update.toolCallId);
-        if (id) s.toolCallIds.add(id);
+        if (id) {
+          s.toolCallIds.add(id);
+          const um = isObj(update._meta) ? update._meta : {};
+          const name = toolCallName(isObj(um['x.ai/tool']) ? um['x.ai/tool'].name : undefined);
+          if (name && !s.toolCallNames.has(id)) s.toolCallNames.set(id, name);
+        }
       } else if (kind === 'turn_completed') {
         const promptId = str(update.prompt_id) ?? `${s.sessionId}:${str(meta.eventId) ?? s.turns.length}`;
         s.turns.push({
@@ -602,6 +612,10 @@ export const grokParser: ToolParser = {
         turns: turnsCount,
         models: [...models],
       };
+      const tally = new Map<string, number>();
+      for (const name of s.toolCallNames.values()) countToolCall(tally, name);
+      const byName = toolCallsRecord(tally);
+      if (byName) info.toolCallsByName = byName;
       if (s.title) info.title = s.title;
       result.sessions.push(info);
     }

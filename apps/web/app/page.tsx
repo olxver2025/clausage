@@ -3,7 +3,10 @@ import Link from "next/link";
 import { Suspense } from "react";
 import { DataTable, type DataColumn, type DataRow } from "@/components/charts/DataTable";
 import { KpiTile } from "@/components/charts/KpiTile";
+import { Ticker } from "@/components/charts/Ticker";
 import { ToolDot } from "@/components/charts/Legend";
+import { modeDetails } from "@/components/models-projects/mode-breakdown";
+import { ModelOrgIcon } from "@/components/icons/BrandIcon";
 import { TodayStrip } from "@/components/overview/TodayStrip";
 import { TokenComposition } from "@/components/overview/TokenComposition";
 import { ToolCard } from "@/components/overview/ToolCard";
@@ -11,11 +14,14 @@ import { UsageChart } from "@/components/overview/UsageChart";
 import { dayStats, lastActiveByTool, periodStats, ratio, requestNow, sessionMeta, type PeriodStats } from "@/components/overview/stats";
 import { PageHeader, Panel } from "@/components/Panel";
 import { PanelSkeleton } from "@/components/Skeleton";
-import { getFilters, getUsage, reportFrom, type UsageData } from "@/lib/data";
+import { cacheEfficiencyFor, getFilters, getUsage, reportFrom, type UsageData } from "@/lib/data";
+import { Insights } from "@/components/overview/Insights";
+import { machineGroups, machineLabel } from "@/lib/machines";
 import { describeRange, filtersToQuery, previousPeriod, rangeDays, todayIn, type Filters } from "@/lib/filters";
 import { formatBucketKey, formatCost, formatDuration, formatNumber, formatPercent, formatTokens, shortPath } from "@/lib/format";
 import { fillDailyGaps, sumValues, toolValues, type Metric, type StackedDatum } from "@/lib/series";
 import { TOOL_LABELS } from "@/lib/tools";
+import { SubscriptionValue } from "@/components/subscriptions/SubscriptionValue";
 
 export const metadata = { title: "Overview" };
 
@@ -61,6 +67,7 @@ async function Overview({ searchParams }: { searchParams: PageProps<"/">["search
     return (
       <div className="flex flex-col gap-3">
         {todayStrip}
+        <Suspense fallback={<PanelSkeleton height={160} label="Loading subscription value…" />}><SubscriptionValue filters={filters} now={now} /></Suspense>
         <EmptyState filters={filters} sourceCount={Object.values(data.sources).reduce((n, list) => n + list.length, 0)} />
       </div>
     );
@@ -89,11 +96,16 @@ async function Overview({ searchParams }: { searchParams: PageProps<"/">["search
         {!filters.allTools && ` · ${filters.tools.map((t) => TOOL_LABELS[t]).join(", ")}`}
       </p>
       {todayStrip}
-      <KpiRow stats={stats} prev={prevStats} days={days} cost={dailyCost} tokens={dailyTokens} />
+      <Suspense fallback={<PanelSkeleton height={160} label="Loading subscription value…" />}><SubscriptionValue filters={filters} now={now} /></Suspense>
+      <KpiRow stats={stats} prev={prevStats} days={days} cost={dailyCost} tokens={dailyTokens} cacheSavedUSD={cacheEfficiencyFor(data, "total")[0]?.savedUSD} />
       <Panel title="Usage over time" description={`Stacked by tool · ${formatCost(ts.totals.costUSD)} · ${formatTokens(ts.totals.totalTokens)} tokens`}>
         <UsageChart cost={chartCost} tokens={chartTokens} unit={UNIT[filters.group]} estimated={estimatedPeriods} />
       </Panel>
+      <Suspense fallback={<PanelSkeleton height={220} label="Loading forecast…" />}>
+        <Insights filters={filters} now={now} />
+      </Suspense>
       <ToolCards {...toolSummaries(data, filters, sessionReport, dailyCost)} filters={filters} now={now} />
+      <Computers data={data} filters={filters} />
       <div className="grid gap-3 lg:grid-cols-2">
         <Panel title="Token composition" description={`${formatTokens(stats.totalTokens)} tokens`} className="lg:col-span-2">
           <TokenComposition {...stats} />
@@ -138,7 +150,22 @@ function topRows(report: Report, n = 5): TopRows {
   return { rows: report.rows.slice(0, n), count: report.rows.length, totalCost: report.totals.costUSD };
 }
 
-function KpiRow({ stats, prev, days, cost, tokens }: { stats: PeriodTotals; prev?: PeriodTotals; days?: number; cost: StackedDatum[]; tokens: StackedDatum[] }) {
+function KpiRow({
+  stats,
+  prev,
+  days,
+  cost,
+  tokens,
+  cacheSavedUSD,
+}: {
+  stats: PeriodTotals;
+  prev?: PeriodTotals;
+  days?: number;
+  cost: StackedDatum[];
+  tokens: StackedDatum[];
+  /** what prompt caching saved versus uncached input, at list prices */
+  cacheSavedUSD?: number;
+}) {
   const vs = days ? `vs prev ${days}d` : undefined;
   // Percentages past +999% read as noise; those show the multiple in the sub line instead.
   const big = (cur: number, before: number | undefined) => {
@@ -153,7 +180,7 @@ function KpiRow({ stats, prev, days, cost, tokens }: { stats: PeriodTotals; prev
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
       <KpiTile
         label="Total cost"
-        value={formatCost(stats.costUSD)}
+        value={<Ticker value={stats.costUSD} format="cost" />}
         delta={delta(stats.costUSD, prev?.costUSD)}
         sub={sub(stats.costUSD, prev?.costUSD, stats.estimatedDays > 0 ? `incl. ${stats.estimatedDays} estimated day${stats.estimatedDays === 1 ? "" : "s"}` : undefined)}
         spark={cost.map((d) => sumValues(d.values))}
@@ -162,7 +189,7 @@ function KpiRow({ stats, prev, days, cost, tokens }: { stats: PeriodTotals; prev
       />
       <KpiTile
         label="Total tokens"
-        value={formatTokens(stats.totalTokens)}
+        value={<Ticker value={stats.totalTokens} format="tokens" />}
         delta={delta(stats.totalTokens, prev?.totalTokens)}
         sub={sub(stats.totalTokens, prev?.totalTokens)}
         spark={tokens.map((d) => sumValues(d.values))}
@@ -171,24 +198,27 @@ function KpiRow({ stats, prev, days, cost, tokens }: { stats: PeriodTotals; prev
       />
       <KpiTile
         label="Sessions"
-        value={formatNumber(stats.sessions)}
+        value={<Ticker value={stats.sessions} format="number" />}
         delta={delta(stats.sessions, prev?.sessions)}
         sub={sub(stats.sessions, prev?.sessions, stats.sessions > 0 ? `${formatCost(stats.costUSD / stats.sessions)} avg` : undefined)}
       />
       <KpiTile
         label="Active time"
-        value={formatDuration(stats.activeMs)}
+        value={<Ticker value={stats.activeMs} format="duration" />}
         delta={delta(stats.activeMs, prev?.activeMs)}
         sub={sub(stats.activeMs, prev?.activeMs, stats.sessions > 0 ? `${formatDuration(stats.activeMs / stats.sessions)} per session` : undefined)}
       />
       <KpiTile
         label="Cache-hit ratio"
         className="col-span-2 lg:col-span-1"
-        value={stats.cacheHit === null ? "—" : formatPercent(stats.cacheHit)}
+        value={stats.cacheHit === null ? "—" : <Ticker value={stats.cacheHit} format="percent" />}
         sub={
-          hitPts !== null
-            ? `${hitPts >= 0 ? "+" : "−"}${Math.abs(hitPts).toFixed(1)} pts ${vs ?? ""}`
-            : "cache read ÷ all input"
+          [
+            cacheSavedUSD !== undefined && cacheSavedUSD > 0 ? `saved ${formatCost(cacheSavedUSD)}` : undefined,
+            hitPts !== null ? `${hitPts >= 0 ? "+" : "−"}${Math.abs(hitPts).toFixed(1)} pts ${vs ?? ""}`.trim() : undefined,
+          ]
+            .filter(Boolean)
+            .join(" · ") || "cache read ÷ all input"
         }
       />
     </div>
@@ -228,7 +258,14 @@ function toolSummaries(
   const total = byCost ? tools.totals.costUSD : tools.totals.totalTokens;
   const summaries = filters.tools.map((t): ToolSummary => {
     const row = byTool.get(t);
-    const top = row ? [...row.breakdown].sort((a, b) => b.costUSD - a.costUSD || b.totalTokens - a.totalTokens)[0] : undefined;
+    const models = new Map<string, { model: string; costUSD: number; totalTokens: number }>();
+    for (const b of row?.breakdown ?? []) {
+      const sum = models.get(b.model) ?? { model: b.model, costUSD: 0, totalTokens: 0 };
+      sum.costUSD += b.costUSD;
+      sum.totalTokens += b.totalTokens;
+      models.set(b.model, sum);
+    }
+    const top = [...models.values()].sort((a, b) => b.costUSD - a.costUSD || b.totalTokens - a.totalTokens)[0];
     const value = row ? (byCost ? row.costUSD : row.totalTokens) : 0;
     return {
       tool: t,
@@ -296,11 +333,12 @@ function TopModels({ report, filters }: { report: TopRows; filters: Filters }) {
   ];
   const rows: DataRow[] = report.rows.map((r) => ({
     id: r.key,
+    modeDetails: modeDetails(r.key, r.breakdown),
     cells: {
       model: (
         <span className="flex min-w-0 items-center gap-1.5">
-          <Tools tools={r.tools} />
-          <span className="truncate font-mono" title={r.key}>
+          <ModelOrgIcon model={r.key} size="0.875rem" />
+          <span className="truncate font-mono" title={`${r.key} · ${r.tools.map((t) => TOOL_LABELS[t]).join(", ")}`}>
             {r.label}
           </span>
         </span>
@@ -317,6 +355,11 @@ function TopModels({ report, filters }: { report: TopRows; filters: Filters }) {
   );
 }
 
+/** A projects-report row's directory (rows are keyed "path@machine" when several computers are synced). */
+function projectPath(r: UsageRow): string {
+  return (r.meta?.project as string | undefined) ?? r.key;
+}
+
 function TopProjects({ report, filters, estimated }: { report: TopRows; filters: Filters; estimated: boolean }) {
   const columns: DataColumn[] = [
     { key: "project", header: "Project", sortable: false },
@@ -330,9 +373,10 @@ function TopProjects({ report, filters, estimated }: { report: TopRows; filters:
       project: (
         <span className="flex min-w-0 items-center gap-1.5">
           <Tools tools={r.tools} />
-          <span className="truncate font-mono" title={r.key || undefined}>
-            {r.key ? shortPath(r.key) : "(unknown)"}
+          <span className="truncate font-mono" title={(r.meta?.project as string | undefined) ?? (r.key || undefined)}>
+            {projectPath(r) ? shortPath(projectPath(r)) : "(unknown)"}
           </span>
+          {typeof r.meta?.machine === "string" && r.key.includes("@") && <span className="truncate text-fg-3">{r.meta.machine}</span>}
         </span>
       ),
       cost: formatCost(r.costUSD),
@@ -372,6 +416,51 @@ function EmptyState({ filters, sourceCount: found }: { filters: Filters; sourceC
           {!filters.allTools && <ViewAll href={allTools}>Show all tools</ViewAll>}
         </div>
       </div>
+    </Panel>
+  );
+}
+
+/** Cost and tokens per computer; only shown when usage from more than one computer is synced. */
+function Computers({ data, filters }: { data: UsageData; filters: Filters }) {
+  const by = new Map<string, { cost: number; tokens: number; tools: Set<ToolId> }>();
+  for (const x of [...data.events, ...data.historical]) {
+    const k = x.machine ?? "";
+    const m = by.get(k) ?? { cost: 0, tokens: 0, tools: new Set<ToolId>() };
+    m.cost += x.costUSD ?? 0;
+    m.tokens += x.inputTokens + x.outputTokens + x.cacheReadTokens + x.cacheWriteTokens;
+    m.tools.add(x.tool);
+    by.set(k, m);
+  }
+  const names = machineGroups(data.machines, by.keys());
+  if (!names.length) return null;
+  const total = [...by.values()].reduce((n, m) => n + m.cost, 0);
+  const columns: DataColumn[] = [
+    { key: "machine", header: "Computer", sortable: false },
+    { key: "tools", header: "Tools", sortable: false, hideBelow: "sm" },
+    { key: "cost", header: "Cost", numeric: true, sortable: false },
+    { key: "tokens", header: "Tokens", numeric: true, sortable: false, hideBelow: "sm" },
+    { key: "share", header: "Share", numeric: true, sortable: false },
+  ];
+  const rows: DataRow[] = names.map((name) => {
+    const m = by.get(name)!;
+    return {
+      id: name || "__unknown",
+      cells: {
+        machine: (
+          <Link href={`/sessions${filtersToQuery({ ...filters, machines: [name] })}`} className="font-medium underline decoration-line-strong underline-offset-2 hover:decoration-accent">
+            {machineLabel(data.machines, name)}
+          </Link>
+        ),
+        tools: <Tools tools={[...m.tools].sort()} />,
+        cost: formatCost(m.cost),
+        tokens: formatTokens(m.tokens),
+        share: total > 0 ? formatPercent(m.cost / total) : "—",
+      },
+    };
+  });
+  return (
+    <Panel title="By computer" description={`${names.length} computers · totals above include all of them`}>
+      <DataTable caption="Usage per computer" columns={columns} rows={rows} />
     </Panel>
   );
 }

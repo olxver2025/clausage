@@ -2,7 +2,9 @@ import type { ToolId } from "@clausage/core";
 import Link from "next/link";
 import type { CSSProperties, ReactNode } from "react";
 import { Sparkline } from "@/components/charts/Sparkline";
-import { formatCost, formatDuration, formatNumber, formatPercent, formatRelative, formatTokens } from "@/lib/format";
+import { Ticker } from "@/components/charts/Ticker";
+import { ToolIcon } from "@/components/icons/BrandIcon";
+import { formatDuration, formatNumber, formatPercent, formatRelative } from "@/lib/format";
 import { TOOL_LABELS, toolColor } from "@/lib/tools";
 
 export interface ToolCardProps {
@@ -31,8 +33,9 @@ export function ToolCard(p: ToolCardProps) {
     >
       <span aria-hidden="true" className="absolute inset-y-0 start-0 w-1 bg-[var(--swatch)]" />
       <header className="flex items-center justify-between gap-2">
-        <h3 id={`tool-card-${p.tool}`} className="truncate text-sm font-semibold">
-          {label}
+        <h3 id={`tool-card-${p.tool}`} className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
+          <ToolIcon tool={p.tool} size="1rem" />
+          <span className="truncate">{label}</span>
         </h3>
         {p.share !== null && !empty && (
           <span className="tabular text-xs text-fg-3">
@@ -46,7 +49,9 @@ export function ToolCard(p: ToolCardProps) {
       ) : (
         <>
           <div className="flex items-end justify-between gap-2">
-            <div className="figure text-xl font-semibold leading-tight">{formatCost(p.costUSD)}</div>
+            <div className="figure text-xl font-semibold leading-tight">
+              <Ticker value={p.costUSD} format="cost" />
+            </div>
             <Sparkline values={p.spark} label={`${label} daily cost`} width={88} height={26} color={toolColor(p.tool)} />
           </div>
           {p.share !== null && (
@@ -55,7 +60,9 @@ export function ToolCard(p: ToolCardProps) {
             </div>
           )}
           <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
-            <Stat label="Tokens">{formatTokens(p.totalTokens)}</Stat>
+            <Stat label="Tokens">
+              <Ticker value={p.totalTokens} format="tokens" />
+            </Stat>
             <Stat label="Sessions">
               {formatNumber(p.sessions)}
               {p.activeMs > 0 && <span className="text-fg-3"> · {formatDuration(p.activeMs)}</span>}

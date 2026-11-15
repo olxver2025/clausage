@@ -100,7 +100,7 @@ export function AgentBridge() {
       {
         name: "set_filters",
         description:
-          "Changes the dashboard filters in the URL. tools: list of claude-code, codex, grok, opencode (empty for all). range: 7d, 30d, 90d, all or custom; since/until (YYYY-MM-DD) imply custom. mode: auto, calculate or display. group: daily, weekly or monthly. tz: an IANA zone, UTC or local. project: a path substring, or empty to clear.",
+          "Changes the dashboard filters in the URL. tools: list of claude-code, codex, grok, opencode, hermes, openclaw, pi, gemini, amp, qwen, copilot, aider (empty for all). range: 7d, 30d, 90d, all or custom; since/until (YYYY-MM-DD) imply custom. mode: auto, calculate or display. group: daily, weekly or monthly. tz: an IANA zone, UTC or local. project: a path substring, or empty to clear.",
         inputSchema: {
           type: "object",
           properties: {

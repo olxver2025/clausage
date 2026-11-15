@@ -2,7 +2,9 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Suspense, type ReactNode } from "react";
-import type { ToolId } from "@clausage/core";
+import { sumTotals, type ModelBreakdown, type ToolId } from "@clausage/core";
+import { modeDetails } from "@/components/models-projects/mode-breakdown";
+import { ModelOrgIcon } from "@/components/icons/BrandIcon";
 import { DataTable, type DataColumn, type DataRow } from "@/components/charts/DataTable";
 import { KpiTile } from "@/components/charts/KpiTile";
 import { ToolName } from "@/components/charts/Legend";
@@ -11,6 +13,7 @@ import { PanelSkeleton } from "@/components/Skeleton";
 import { baseName, displayTitle, safeDecode, shortId } from "@/components/sessions/links";
 import { getSessionDetail, type SessionDetail } from "@/components/sessions/session-detail";
 import { SessionTimeline } from "@/components/sessions/SessionTimeline";
+import { McpServerLine, ToolCallBars } from "@/components/sessions/ToolCalls";
 import { getFilters } from "@/lib/data";
 import { filtersToQuery } from "@/lib/filters";
 import { formatCost, formatDateTime, formatDuration, formatNumber, formatPercent, formatTokens } from "@/lib/format";
@@ -132,6 +135,18 @@ async function Content({ params, searchParams }: Pick<Props, "params" | "searchP
           <ModelsTable detail={detail} />
         </Panel>
 
+        <Panel
+          title="Tool calls"
+          description={
+            meta.toolCalls > 0
+              ? `${formatNumber(meta.toolCalls)} calls${subagents.length ? " incl. subagents" : ""} · ${formatCost(totals.costUSD / meta.toolCalls)} per call · tool names only`
+              : undefined
+          }
+        >
+          <ToolCallBars title="Tool calls by tool name" sessions={[meta]} limit={15} />
+          <McpServerLine sessions={[meta]} />
+        </Panel>
+
         <Panel title="Subagents" description={subagents.length ? `${formatNumber(subagents.length)} subagent sessions · main thread ${formatCost(main.costUSD)}` : undefined}>
           <SubagentsTable detail={detail} />
         </Panel>
@@ -163,31 +178,41 @@ const MODEL_COLUMNS: DataColumn[] = [
 
 function ModelsTable({ detail }: { detail: SessionDetail }) {
   const total = detail.totals.costUSD;
-  const rows: DataRow[] = detail.breakdown.map((b) => ({
-    id: `${b.tool}:${b.model}`,
-    cells: {
-      model: <span className="tabular">{b.model || "(unknown)"}</span>,
-      events: formatNumber(b.events),
-      input: formatTokens(b.inputTokens),
-      output: formatTokens(b.outputTokens),
-      cacheRead: formatTokens(b.cacheReadTokens),
-      cacheWrite: formatTokens(b.cacheWriteTokens),
-      tokens: formatTokens(b.totalTokens),
-      cost: formatCost(b.costUSD),
-      share: formatPercent(total ? b.costUSD / total : null),
-    },
-    sort: {
-      model: b.model,
-      events: b.events,
-      input: b.inputTokens,
-      output: b.outputTokens,
-      cacheRead: b.cacheReadTokens,
-      cacheWrite: b.cacheWriteTokens,
-      tokens: b.totalTokens,
-      cost: b.costUSD,
-      share: b.costUSD,
-    },
-  }));
+  const byModel = new Map<string, ModelBreakdown[]>();
+  for (const part of detail.breakdown) {
+    const parts = byModel.get(part.model) ?? [];
+    parts.push(part);
+    byModel.set(part.model, parts);
+  }
+  const rows: DataRow[] = [...byModel].map(([model, parts]) => {
+    const b = sumTotals(parts);
+    return {
+      id: model,
+      modeDetails: modeDetails(model, parts),
+      cells: {
+        model: <span className="inline-flex items-center gap-1.5"><ModelOrgIcon model={model} size="0.875rem" />{model || "(unknown)"}</span>,
+        events: formatNumber(b.events),
+        input: formatTokens(b.inputTokens),
+        output: formatTokens(b.outputTokens),
+        cacheRead: formatTokens(b.cacheReadTokens),
+        cacheWrite: formatTokens(b.cacheWriteTokens),
+        tokens: formatTokens(b.totalTokens),
+        cost: formatCost(b.costUSD),
+        share: formatPercent(total ? b.costUSD / total : null),
+      },
+      sort: {
+        model,
+        events: b.events,
+        input: b.inputTokens,
+        output: b.outputTokens,
+        cacheRead: b.cacheReadTokens,
+        cacheWrite: b.cacheWriteTokens,
+        tokens: b.totalTokens,
+        cost: b.costUSD,
+        share: b.costUSD,
+      },
+    };
+  });
   return <DataTable caption="Usage by model in this session" columns={MODEL_COLUMNS} rows={rows} defaultSort={{ key: "cost", dir: "desc" }} emptyMessage="No model usage recorded." />;
 }
 
@@ -215,7 +240,7 @@ function SubagentsTable({ detail }: { detail: SessionDetail }) {
       active: formatDuration(s.activeMs),
       events: formatNumber(s.events),
       toolCalls: formatNumber(s.toolCalls),
-      models: <span className="text-fg-2">{s.models.join(", ") || "–"}</span>,
+      models: <span className="text-fg-2">{s.models.join(", ") || "–"}{s.speeds.length > 0 && ` · ${s.speeds.join(", ")}`}</span>,
       tokens: formatTokens(s.totalTokens),
       cost: formatCost(s.costUSD),
     },

@@ -8,6 +8,7 @@ import type {
   UsageEvent,
   UsageRow,
 } from './types.js';
+import { usageSpeed } from './speed.js';
 import { computeActiveMs } from './parsers/util.js';
 
 export type ReportKind = Report['kind'];
@@ -39,6 +40,8 @@ export interface BuildReportOptions {
   startOfWeek?: WeekDay;
   /** clock used for active-block detection (default Date.now()) */
   now?: number;
+  /** usage-limit windows and settings for 'blocks' */
+  blockLimits?: BlockLimitOptions;
 }
 
 const HOUR_MS = 3600_000;
@@ -263,10 +266,11 @@ function accAdd(a: Acc, x: UsageEvent | DailyAggregate, keepEvents = false): voi
   addTotals(a.totals, x);
   a.tools.add(x.tool);
   if (x.model) a.models.add(x.model);
-  const bk = `${x.tool}\u0000${x.model}`;
+  const speed = isAggregate(x) ? undefined : usageSpeed(x.model, x.speed);
+  const bk = `${x.tool}\u0000${x.model}\u0000${speed ?? ''}`;
   let b = a.breakdown.get(bk);
   if (!b) {
-    b = { ...emptyTotals(), model: x.model, tool: x.tool };
+    b = { ...emptyTotals(), model: x.model, tool: x.tool, ...(speed ? { speed } : {}) };
     a.breakdown.set(bk, b);
   }
   addTotals(b, x);
@@ -331,6 +335,25 @@ export interface BlockMeta {
   burnRate: { tokensPerMinute: number; tokensPerMinuteIndicator: number; costPerHour: number } | null;
   projection: { totalTokens: number; totalCost: number; remainingMinutes: number } | null;
   sessions: number;
+  /** the block is the provider's reported limit window (exact start and reset) */
+  anchored?: boolean;
+  /** how much of the 5-hour usage limit the block used */
+  limit?: {
+    /** % of the limit (reported peak, or tokens ÷ configured limit) */
+    percent?: number;
+    source: 'reported' | 'configured';
+    limitTokens?: number;
+    /** a request in the block was refused for a usage limit */
+    hit?: boolean;
+  };
+}
+
+export interface BlockLimitOptions {
+  /** reported limit windows per tool; events inside one form exactly that block */
+  anchors?: Map<ToolId, Array<{ start: number; end: number; peakPercent: number }>>;
+  /** configured 5-hour token limit per tool */
+  fiveHourTokens?: Partial<Record<ToolId, number>>;
+  hits?: Array<{ tool: ToolId; timestamp: number }>;
 }
 
 function floorToHourUTC(ts: number): number {
@@ -344,7 +367,7 @@ function floorToHourUTC(ts: number): number {
  */
 export function buildBlocks(
   events: UsageEvent[],
-  opts: { sessionLengthHours?: number; now?: number; breakdown?: boolean } = {},
+  opts: { sessionLengthHours?: number; now?: number; breakdown?: boolean; limits?: BlockLimitOptions } = {},
 ): UsageRow[] {
   const L = (opts.sessionLengthHours ?? 5) * HOUR_MS;
   const now = opts.now ?? Date.now();
@@ -357,11 +380,21 @@ export function buildBlocks(
   const rows: UsageRow[] = [];
   for (const [tool, list] of byTool) {
     list.sort((a, b) => a.timestamp - b.timestamp);
-    let cur: { start: number; acc: Acc; first: number; last: number; sessions: Set<string> } | null = null;
+    let cur: { start: number; end: number; anchor?: { start: number; end: number; peakPercent: number }; acc: Acc; first: number; last: number; sessions: Set<string> } | null = null;
     let prevEnd: number | null = null;
+    const anchors = opts.limits?.anchors?.get(tool) ?? [];
+    const limitTokens = opts.limits?.fiveHourTokens?.[tool];
+    const hitTimes = (opts.limits?.hits ?? []).filter((h) => h.tool === tool).map((h) => h.timestamp);
+    let ai = 0;
+    const anchorFor = (ts: number) => {
+      while (ai < anchors.length && anchors[ai]!.end < ts) ai++;
+      const a = anchors[ai];
+      // the request that opens a window can be logged a moment before the reported start
+      return a && a.start - 120_000 <= ts && ts <= a.end ? a : undefined;
+    };
     const flush = () => {
       if (!cur) return;
-      const end = cur.start + L;
+      const end = cur.end;
       const t = cur.acc.totals;
       const durMin = (cur.last - cur.first) / 60_000;
       const isActive = now - cur.last < L && now < end;
@@ -377,6 +410,12 @@ export function buildBlocks(
         sessions: cur.sessions.size,
       };
       if (prevEnd !== null && cur.first - prevEnd > L) meta.gapBeforeMs = cur.first - prevEnd;
+      if (cur.anchor) meta.anchored = true;
+      const blockStart = cur.start;
+      const hit = hitTimes.some((h) => h >= blockStart && h <= end);
+      if (cur.anchor) meta.limit = { percent: cur.anchor.peakPercent, source: 'reported', ...(hit ? { hit } : {}) };
+      else if (limitTokens) meta.limit = { percent: (t.totalTokens / limitTokens) * 100, source: 'configured', limitTokens, ...(hit ? { hit } : {}) };
+      else if (hit) meta.limit = { source: 'configured', hit };
       if (durMin > 0) {
         meta.burnRate = {
           tokensPerMinute: t.totalTokens / durMin,
@@ -399,11 +438,21 @@ export function buildBlocks(
       cur = null;
     };
     for (const e of list) {
-      if (cur && (e.timestamp - cur.start > L || e.timestamp - cur.last > L)) flush();
+      const anchor = anchors.length ? anchorFor(e.timestamp) : undefined;
+      if (cur && anchor !== cur.anchor) flush();
+      else if (cur && !anchor && (e.timestamp - cur.start > L || e.timestamp - cur.last > L)) flush();
       if (!cur) {
-        const start = floorToHourUTC(e.timestamp);
+        // A reported window fixes the block exactly; otherwise it starts at the hour of the first request.
+        let start: number = anchor ? Math.min(anchor.start, e.timestamp) : floorToHourUTC(e.timestamp);
+        let end: number = anchor ? anchor.end : start + L;
+        if (!anchor) {
+          // never overlap the next reported window
+          const next = anchors[ai];
+          if (next && next.start - 120_000 > e.timestamp && next.start - 120_000 < end) end = next.start - 120_000;
+        }
+        if (start > e.timestamp) start = e.timestamp;
         const iso = new Date(start).toISOString();
-        cur = { start, acc: newAcc(`${tool}:${iso}`, iso), first: e.timestamp, last: e.timestamp, sessions: new Set() };
+        cur = { start, end, ...(anchor ? { anchor } : {}), acc: newAcc(`${tool}:${iso}`, iso), first: e.timestamp, last: e.timestamp, sessions: new Set() };
       }
       accAdd(cur.acc, e);
       cur.last = e.timestamp;
@@ -425,29 +474,125 @@ export interface SessionMeta {
   startedAt: number;
   endedAt: number;
   activeMs: number;
+  /** tool calls of the root session and its folded subagents */
   toolCalls: number;
+  /** the same calls per tool name, when the tool's logs record names (names only) */
+  toolCallsByName?: Record<string, number>;
   userMessages: number;
   assistantMessages: number;
   turns: number;
   subagents: number;
   version?: string;
+  /** computer the session ran on, when sync is set up */
+  machine?: string;
+}
+
+/** Tool calls of one tool name, summed over sessions. */
+export interface ToolCallStat {
+  name: string;
+  calls: number;
+  /** sessions (of those passed in) that called it at least once */
+  sessions: number;
+}
+
+/** Calls per MCP server, from tool names of the form `mcp__<server>__<tool>`. */
+export interface McpServerStat {
+  server: string;
+  calls: number;
+  /** distinct tools of the server that were called */
+  tools: number;
+  sessions: number;
+}
+
+type WithToolCalls = { toolCallsByName?: Record<string, number> };
+
+const byCallsThenName = <T extends { calls: number }>(key: (x: T) => string) => (a: T, b: T) =>
+  b.calls - a.calls || (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0);
+
+/** Sum `toolCallsByName` over sessions; undefined when none has names. Keys sorted. */
+export function mergeToolCallsByName(sessions: Iterable<WithToolCalls>): Record<string, number> | undefined {
+  const tally = new Map<string, number>();
+  for (const s of sessions) {
+    for (const [name, n] of Object.entries(s.toolCallsByName ?? {})) {
+      if (n > 0) tally.set(name, (tally.get(name) ?? 0) + n);
+    }
+  }
+  if (tally.size === 0) return undefined;
+  return Object.fromEntries([...tally].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
+}
+
+/**
+ * Tool calls per tool name across sessions (SessionInfo or session-report SessionMeta), most
+ * called first. Pass root-session metas to count a session with its subagents once.
+ */
+export function toolCallStats(sessions: Iterable<WithToolCalls>): ToolCallStat[] {
+  const stats = new Map<string, ToolCallStat>();
+  for (const s of sessions) {
+    for (const [name, n] of Object.entries(s.toolCallsByName ?? {})) {
+      if (!(n > 0)) continue;
+      let st = stats.get(name);
+      if (!st) stats.set(name, (st = { name, calls: 0, sessions: 0 }));
+      st.calls += n;
+      st.sessions++;
+    }
+  }
+  return [...stats.values()].sort(byCallsThenName((x) => x.name));
+}
+
+/** The server of an MCP tool name (`mcp__<server>__<tool>`), else undefined. */
+export function mcpServerOf(name: string): string | undefined {
+  if (!name.startsWith('mcp__')) return undefined;
+  const rest = name.slice(5);
+  const sep = rest.indexOf('__');
+  const server = sep === -1 ? rest : rest.slice(0, sep);
+  return server || undefined;
+}
+
+/** Tool calls grouped by MCP server, most called first. Non-MCP tool names are left out. */
+export function mcpServerStats(sessions: Iterable<WithToolCalls>): McpServerStat[] {
+  const stats = new Map<string, { calls: number; tools: Set<string>; sessions: number }>();
+  for (const s of sessions) {
+    const seen = new Set<string>();
+    for (const [name, n] of Object.entries(s.toolCallsByName ?? {})) {
+      const server = n > 0 ? mcpServerOf(name) : undefined;
+      if (!server) continue;
+      let st = stats.get(server);
+      if (!st) stats.set(server, (st = { calls: 0, tools: new Set(), sessions: 0 }));
+      st.calls += n;
+      st.tools.add(name);
+      if (!seen.has(server)) {
+        seen.add(server);
+        st.sessions++;
+      }
+    }
+  }
+  return [...stats]
+    .map(([server, st]) => ({ server, calls: st.calls, tools: st.tools.size, sessions: st.sessions }))
+    .sort(byCallsThenName((x) => x.server));
+}
+
+/** Report row key of a root session; the machine is appended only for synced remote data. */
+export function sessionRowKey(tool: ToolId, root: string, machine?: string): string {
+  return machine ? `${tool}:${root}@${machine}` : `${tool}:${root}`;
 }
 
 function buildSessions(events: UsageEvent[], sessions: SessionInfo[], breakdown: boolean): UsageRow[] {
-  const groups = new Map<string, { acc: Acc; tool: ToolId; root: string; infos: SessionInfo[]; ts: number[]; project: string }>();
-  const get = (tool: ToolId, root: string) => {
-    const k = `${tool}:${root}`;
+  const groups = new Map<string, { acc: Acc; tool: ToolId; root: string; machine?: string; infos: SessionInfo[]; ts: number[]; project: string }>();
+  // Machine names only enter the key when more than one computer is present, so single-machine keys stay stable.
+  const multi = new Set(events.map((e) => e.machine ?? '')).size > 1 || new Set(sessions.map((s) => s.machine ?? '')).size > 1;
+  const get = (tool: ToolId, root: string, machine: string | undefined) => {
+    const k = sessionRowKey(tool, root, multi ? machine : undefined);
     let g = groups.get(k);
-    if (!g) groups.set(k, (g = { acc: newAcc(k, root), tool, root, infos: [], ts: [], project: '' }));
+    if (!g) groups.set(k, (g = { acc: newAcc(k, root), tool, root, machine, infos: [], ts: [], project: '' }));
     return g;
   };
   for (const e of events) {
-    const g = get(e.tool, e.rootSessionId || e.sessionId);
+    const g = get(e.tool, e.rootSessionId || e.sessionId, e.machine);
     accAdd(g.acc, e);
     g.ts.push(e.timestamp);
     if (!g.project && e.project) g.project = e.project;
   }
-  for (const s of sessions) get(s.tool, s.rootSessionId || s.sessionId).infos.push(s);
+  for (const s of sessions) get(s.tool, s.rootSessionId || s.sessionId, s.machine).infos.push(s);
 
   const rows: UsageRow[] = [];
   for (const g of groups.values()) {
@@ -486,6 +631,7 @@ function buildSessions(events: UsageEvent[], sessions: SessionInfo[], breakdown:
     );
     const title = rootInfo?.title ?? g.infos.find((s) => s.title)?.title;
     const version = rootInfo?.version;
+    const toolCallsByName = mergeToolCallsByName(g.infos);
     const meta: SessionMeta = {
       tool: g.tool,
       sessionId: g.root,
@@ -495,11 +641,13 @@ function buildSessions(events: UsageEvent[], sessions: SessionInfo[], breakdown:
       endedAt,
       activeMs,
       toolCalls,
+      ...(toolCallsByName ? { toolCallsByName } : {}),
       userMessages,
       assistantMessages,
       turns,
       subagents: subs.size,
       ...(version ? { version } : {}),
+      ...(g.machine ? { machine: g.machine } : {}),
     };
     g.acc.tools.add(g.tool);
     for (const s of g.infos) for (const m of s.models || []) if (m) g.acc.models.add(m);
@@ -572,18 +720,27 @@ export function buildReport(
       break;
     }
     case 'projects': {
-      const m = groupBy(events, [], (e) => e.project || '', null);
+      // With several computers, the same path on two machines is two projects.
+      const multi = new Set(events.map((e) => e.machine ?? '')).size > 1;
+      const keyOf = (e: UsageEvent) => (multi ? `${e.machine ?? ''}\u0000${e.project || ''}` : e.project || '');
+      const m = groupBy(events, [], keyOf, null);
       // count sessions per project
       const sess = new Map<string, Set<string>>();
+      const machineOf = new Map<string, string | undefined>();
       for (const e of events) {
-        const k = e.project || '';
+        const k = keyOf(e);
         let s = sess.get(k);
         if (!s) sess.set(k, (s = new Set()));
         s.add(`${e.tool}:${e.rootSessionId || e.sessionId}`);
+        if (!machineOf.has(k)) machineOf.set(k, e.machine);
       }
       rows = [...m.values()].map((a) => {
-        a.label = a.key || '(unknown)';
-        a.meta = { sessions: sess.get(a.key)?.size ?? 0 };
+        const project = multi ? a.key.slice(a.key.indexOf('\u0000') + 1) : a.key;
+        const machine = machineOf.get(a.key);
+        const sessions = sess.get(a.key)?.size ?? 0;
+        if (multi) a.key = `${project}@${machine ?? ''}`;
+        a.label = project || '(unknown)';
+        a.meta = { sessions, project, ...(machine ? { machine } : {}) };
         return finish(a, breakdown);
       });
       rows.sort(byCost);
@@ -599,7 +756,7 @@ export function buildReport(
       break;
     }
     case 'blocks': {
-      rows = buildBlocks(events, { sessionLengthHours: opts.sessionLengthHours, now: opts.now, breakdown });
+      rows = buildBlocks(events, { sessionLengthHours: opts.sessionLengthHours, now: opts.now, breakdown, ...(opts.blockLimits ? { limits: opts.blockLimits } : {}) });
       rows.sort((a, b) => {
         const sa = Date.parse(String(a.meta?.startTime));
         const sb = Date.parse(String(b.meta?.startTime));

@@ -172,6 +172,14 @@ export const TOOL_SHORT: Record<ToolId, string> = {
   codex: 'codex',
   grok: 'grok',
   opencode: 'opencode',
+  hermes: 'hermes',
+  openclaw: 'openclaw',
+  pi: 'pi',
+  gemini: 'gemini',
+  amp: 'amp',
+  qwen: 'qwen',
+  copilot: 'copilot',
+  aider: 'aider',
 };
 
 const TOOL_COLOR: Record<ToolId, (s: string) => string> = {
@@ -179,6 +187,14 @@ const TOOL_COLOR: Record<ToolId, (s: string) => string> = {
   codex: (s) => c.green(s),
   grok: (s) => c.magenta(s),
   opencode: (s) => c.cyan(s),
+  hermes: (s) => c.blue(s),
+  openclaw: (s) => c.red(s),
+  pi: (s) => c.cyan(s),
+  gemini: (s) => c.blue(s),
+  amp: (s) => c.red(s),
+  qwen: (s) => c.magenta(s),
+  copilot: (s) => c.green(s),
+  aider: (s) => c.yellow(s),
 };
 
 export function toolName(t: ToolId): string {

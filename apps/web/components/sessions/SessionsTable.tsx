@@ -39,6 +39,8 @@ export interface SessionListRow {
   costUSD: number;
   costUnknown: boolean;
   href: string;
+  /** computer the session ran on, when sync is set up */
+  machine?: string;
 }
 
 type SortKey = "tool" | "title" | "project" | "startedAt" | "endedAt" | "activeMs" | "turns" | "toolCalls" | "subagents" | "models" | "totalTokens" | "costUSD";

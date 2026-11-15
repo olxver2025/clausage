@@ -1,14 +1,18 @@
-import type { ToolId } from "@clausage/core";
+import { FastModeIcon } from "@/components/icons/FastModeIcon";
+import { usagePricing, type ModelBreakdown, type ToolId } from "@clausage/core";
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import { DataTable, type DataColumn, type DataRow } from "@/components/charts/DataTable";
 import { Legend, ToolName } from "@/components/charts/Legend";
 import { ShareBars, type ShareItem } from "@/components/charts/ShareBars";
+import { ModelOrgIcon } from "@/components/icons/BrandIcon";
+import { modeDetails, hasFastUsage } from "@/components/models-projects/mode-breakdown";
 import { Badge, formatRate, ShareCell } from "@/components/models-projects/cells";
 import { PageHeader, Panel } from "@/components/Panel";
 import { PanelSkeleton } from "@/components/Skeleton";
-import { getFilters, getUsage, lookupPricing, reportFrom } from "@/lib/data";
-import { describeRange } from "@/lib/filters";
+import { cacheEfficiencyFor, getFilters, getUsage, lookupPricing, reportFrom } from "@/lib/data";
+import { CacheEfficiencyPanel } from "@/components/models-projects/CacheEfficiency";
+import { describeRange, filtersToQuery } from "@/lib/filters";
 import { formatCost, formatNumber, formatTokens } from "@/lib/format";
 import { TOOL_IDS, TOOL_LABELS } from "@/lib/tools";
 
@@ -48,32 +52,35 @@ async function Content({ searchParams }: { searchParams: PageProps<"/models">["s
   const data = await getUsage(filters);
   const report = reportFrom(data, "models", filters);
 
-  const unknown = new Set<string>();
-  for (const e of data.events) if (e.costUnknown) unknown.add(`${e.tool}|${e.model || "(unknown)"}`);
-  for (const h of data.historical) if (h.costUnknown) unknown.add(`${h.tool}|${h.model || "(unknown)"}`);
-
-  const entries = report.rows.flatMap((row) => row.breakdown.map((b) => ({ ...b, model: b.model || row.key })));
+  const entries = report.rows;
   const totalCost = report.totals.costUSD;
 
   const rows: DataRow[] = entries.map((b) => {
-    const id = `${b.tool}|${b.model}`;
-    const price = lookupPricing(data, b.model, b.tool);
+    const model = b.key;
+    const priceFor = (part: ModelBreakdown) => {
+      const base = lookupPricing(data, model, part.tool);
+      return base && usagePricing(base, model, part.speed);
+    };
+    const prices = b.breakdown.map(priceFor);
+    const price = prices[0];
+    const varies = prices.some((p) => p?.input !== price?.input || p?.output !== price?.output || p?.cacheRead !== price?.cacheRead || p?.cacheWrite !== price?.cacheWrite);
     const share = totalCost > 0 ? b.costUSD / totalCost : 0;
     const rate = b.totalTokens > 0 ? (b.costUSD / b.totalTokens) * M : undefined;
-    const unpriced = unknown.has(id);
     return {
-      id,
+      id: model,
+      modeDetails: modeDetails(model, b.breakdown, priceFor),
       cells: {
         model: (
-          <span className="flex min-w-[8rem] max-w-[18rem] flex-col gap-0.5">
+          <span className="flex max-w-[18rem] flex-col gap-0.5">
             <span className="flex flex-wrap items-center gap-1.5">
-              <span className="font-mono text-xs [overflow-wrap:anywhere] text-fg">{b.model}</span>
-              {unpriced && <Badge title="No price found for some or all of this model's usage; its cost is understated">unpriced</Badge>}
+              <ModelOrgIcon model={model} size="0.875rem" />
+              <span className="font-mono text-xs [overflow-wrap:anywhere] text-fg">{model}</span>
+              {Boolean(b.meta?.costUnknown) && <Badge title="No price found for some or all of this model's usage; its cost is understated">unpriced</Badge>}
             </span>
-            <span className="text-[0.6875rem] text-fg-3 sm:hidden">{TOOL_LABELS[b.tool]}</span>
+            <span className="text-[0.6875rem] text-fg-3 sm:hidden">{b.tools.map((t) => TOOL_LABELS[t]).join(", ")}</span>
           </span>
         ),
-        tool: <ToolName tool={b.tool} />,
+        tool: <span className="flex flex-wrap gap-2">{b.tools.map((t) => <ToolName key={t} tool={t} />)}</span>,
         events: formatNumber(b.events),
         input: formatTokens(b.inputTokens),
         output: formatTokens(b.outputTokens),
@@ -82,9 +89,9 @@ async function Content({ searchParams }: { searchParams: PageProps<"/models">["s
         cacheRead: formatTokens(b.cacheReadTokens),
         total: formatTokens(b.totalTokens),
         cost: formatCost(b.costUSD),
-        share: <ShareCell share={share} tool={b.tool} />,
+        share: <ShareCell share={share} tool={b.tools[0]!} />,
         rate: formatRate(rate),
-        pricing: price ? (
+        pricing: varies ? "Varies by mode or tool" : price ? (
           <span className="flex flex-col gap-0.5 text-[0.6875rem]">
             <span className="max-w-[18rem] font-mono [overflow-wrap:anywhere] text-fg-2">{price.key}</span>
             <span className="tabular whitespace-nowrap text-fg-3">
@@ -98,8 +105,8 @@ async function Content({ searchParams }: { searchParams: PageProps<"/models">["s
         ),
       },
       sort: {
-        model: b.model,
-        tool: TOOL_LABELS[b.tool],
+        model,
+        tool: b.tools.map((t) => TOOL_LABELS[t]).join(", "),
         events: b.events,
         input: b.inputTokens,
         output: b.outputTokens,
@@ -116,7 +123,7 @@ async function Content({ searchParams }: { searchParams: PageProps<"/models">["s
 
   const t = report.totals;
   const footer = {
-    model: `${formatNumber(entries.length)} models`,
+    model: `${formatNumber(report.rows.length)} models`,
     events: formatNumber(t.events),
     input: formatTokens(t.inputTokens),
     output: formatTokens(t.outputTokens),
@@ -129,25 +136,32 @@ async function Content({ searchParams }: { searchParams: PageProps<"/models">["s
   };
 
   const items: ShareItem[] = entries.map((b) => ({
-    key: `${b.tool}|${b.model}`,
-    label: b.model,
-    text: `${b.model} (${TOOL_LABELS[b.tool]})`,
+    key: b.key,
+    label: hasFastUsage(b.breakdown) ? <>{b.label} <FastModeIcon /></> : b.label,
+    text: b.label,
     value: b.costUSD,
-    tool: b.tool,
-    hint: TOOL_LABELS[b.tool],
+    tool: b.tools.length === 1 ? b.tools[0] : undefined,
+    hint: b.tools.map((t) => TOOL_LABELS[t]).join(", "),
   }));
-  const chartTools: ToolId[] = TOOL_IDS.filter((tool) => entries.some((b) => b.tool === tool && b.costUSD > 0));
+  const cache = cacheEfficiencyFor(data, "model");
+  const cacheTotal = cacheEfficiencyFor(data, "total")[0];
+  const chartTools: ToolId[] = TOOL_IDS.filter((tool) => entries.some((b) => b.tools.includes(tool) && b.costUSD > 0));
 
   return (
     <div className="flex flex-col gap-3">
       <Panel
         title="Cost by model"
-        description={`${describeRange(filters)} · ${formatCost(totalCost)} across ${formatNumber(entries.length)} tool/model pairs`}
+        description={`${describeRange(filters)} · ${formatCost(totalCost)} across ${formatNumber(entries.length)} models`}
       >
         <Legend tools={chartTools} className="mb-3" />
         <ShareBars title="Cost by model" items={items} format={formatCost} limit={12} emptyMessage="No priced usage in this range." />
       </Panel>
-      <Panel title="All models" description="Token columns are disjoint: total = input + output + cache write + cache read. Reasoning is part of output.">
+      <CacheEfficiencyPanel rows={cache} total={cacheTotal} />
+      <Panel
+        title="All models"
+        description="Token columns are disjoint: total = input + output + cache write + cache read. Reasoning is part of output."
+        actions={<CsvLink href={`/api/usage${csvQuery(filtersToQuery(filters), "models")}`} />}
+      >
         <DataTable
           caption="Usage and pricing per tool and model"
           columns={columns}
@@ -159,5 +173,21 @@ async function Content({ searchParams }: { searchParams: PageProps<"/models">["s
         />
       </Panel>
     </div>
+  );
+}
+
+function csvQuery(query: string, kind: string): string {
+  const params = new URLSearchParams(query.replace(/^\?/, ""));
+  params.set("kind", kind);
+  params.set("format", "csv");
+  params.set("breakdown", "1");
+  return `?${params.toString()}`;
+}
+
+function CsvLink({ href }: { href: string }) {
+  return (
+    <a href={href} download className="text-xs text-fg-2 underline-offset-2 hover:text-fg hover:underline">
+      Download CSV
+    </a>
   );
 }

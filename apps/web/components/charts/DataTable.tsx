@@ -1,7 +1,8 @@
 "use client";
 
+import { FastModeIcon } from "@/components/icons/FastModeIcon";
 import type { ReactNode } from "react";
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 
 export interface DataColumn {
   key: string;
@@ -17,6 +18,7 @@ export interface DataColumn {
 
 export interface DataRow {
   id: string;
+  modeDetails?: { label: string; content: ReactNode };
   /** rendered cell per column key (strings, numbers or server-rendered elements) */
   cells: Record<string, ReactNode>;
   /** sort keys per column; falls back to the cell when it is a string or number */
@@ -55,6 +57,8 @@ function sortValue(row: DataRow, key: string): string | number | null {
 
 export function DataTable({ caption, showCaption = false, columns, rows, defaultSort, maxHeight, emptyMessage = "No rows.", footer, className = "" }: DataTableProps) {
   const [sort, setSort] = useState(defaultSort ?? null);
+
+  const [expanded, setExpanded] = useState<string | null>(null);
 
   const sorted = useMemo(() => {
     if (!sort) return rows;
@@ -119,13 +123,26 @@ export function DataTable({ caption, showCaption = false, columns, rows, default
             </tr>
           ) : (
             sorted.map((row) => (
-              <tr key={row.id} className="border-t border-line first:border-t-0 hover:bg-surface-hover">
-                {columns.map((col) => (
-                  <td key={col.key} className={cellClass(col)}>
-                    {row.cells[col.key]}
-                  </td>
-                ))}
-              </tr>
+              <Fragment key={row.id}>
+                <tr className="border-t border-line first:border-t-0 hover:bg-surface-hover">
+                  {columns.map((col, index) => (
+                    <td key={col.key} className={cellClass(col)}>
+                      {index === 0 && row.modeDetails ? (
+                        <button type="button" className="inline-flex items-center gap-1 text-start"
+                          aria-label={row.modeDetails.label} aria-expanded={expanded === row.id}
+                          onClick={() => setExpanded(expanded === row.id ? null : row.id)}>
+                          {row.cells[col.key]}
+                          <FastModeIcon />
+                          <span aria-hidden="true" className="text-sm text-fg-3">{expanded === row.id ? "▴" : "▾"}</span>
+                        </button>
+                      ) : row.cells[col.key]}
+                    </td>
+                  ))}
+                </tr>
+                {row.modeDetails && expanded === row.id && <tr className="bg-surface-2">
+                  <td colSpan={columns.length}>{row.modeDetails.content}</td>
+                </tr>}
+              </Fragment>
             ))
           )}
         </tbody>

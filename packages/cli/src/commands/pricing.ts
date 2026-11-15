@@ -1,4 +1,4 @@
-import { loadPricing } from '@clausage/core';
+import { loadPricing, pricingForServiceTier } from '@clausage/core';
 import { UsageError, type CliOptions } from '../args.js';
 import { printJson } from '../context.js';
 import { c } from '../format.js';
@@ -34,9 +34,15 @@ export async function runPricing(opts: CliOptions): Promise<void> {
       { header: 'Cache Write 5m', align: 'right' },
       { header: 'Cache Write 1h', align: 'right' },
     ]);
-    t.push(['base', perM(p.input), perM(p.output), perM(p.cacheRead), perM(p.cacheWrite), perM(p.cacheWrite1h)]);
-    for (const tier of p.tiers ?? []) {
-      t.push([`> ${Math.round(tier.threshold / 1000)}k prompt`, perM(tier.input), perM(tier.output), perM(tier.cacheRead), perM(tier.cacheWrite), c.dim('-')]);
+    const modes = [undefined, 'priority', 'ultrafast', 'flex'] as const;
+    for (const mode of modes) {
+      if (mode && !p.serviceTiers?.[mode]) continue;
+      const price = pricingForServiceTier(p, mode);
+      const label = mode === 'priority' ? 'fast' : mode ?? 'base';
+      t.push([label, perM(price.input), perM(price.output), perM(price.cacheRead), perM(price.cacheWrite), perM(price.cacheWrite1h)]);
+      for (const tier of price.tiers ?? []) {
+        t.push([`${label} > ${Math.round(tier.threshold / 1000)}k prompt`, perM(tier.input), perM(tier.output), perM(tier.cacheRead), perM(tier.cacheWrite), c.dim('-')]);
+      }
     }
     process.stdout.write(t.render() + '\n');
   }

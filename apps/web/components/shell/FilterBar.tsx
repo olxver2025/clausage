@@ -9,7 +9,8 @@ import { Select, SelectContent, SelectItem, SelectItemIndicator, SelectTrigger, 
 import { Toggle, ToggleGroup } from "@ui-sdk/react/toggle";
 import { refreshUsage } from "@/app/actions";
 import { COST_MODE_LABELS, COST_MODES, RANGE_LABELS, RANGE_PRESETS, todayIn, type RangePreset } from "@/lib/filters";
-import { TOOL_IDS, TOOL_SHORT_LABELS, TOOL_LABELS, isToolId, toolColor } from "@/lib/tools";
+import { ToolIcon } from "@/components/icons/BrandIcon";
+import { TOOL_IDS, TOOL_LABELS, isToolId } from "@/lib/tools";
 import { useFilters, usePendingTransition, useUrlState } from "./navigation";
 
 const modeItems = COST_MODES.map((m) => ({ value: m, label: COST_MODE_LABELS[m] }));
@@ -98,9 +99,8 @@ export function FilterBar() {
           }}
         >
           {TOOL_IDS.map((t) => (
-            <Toggle key={t} value={t} className="tool-toggle" aria-label={TOOL_LABELS[t]}>
-              <span aria-hidden="true" className="tool-swatch" style={{ "--swatch": toolColor(t) } as React.CSSProperties} />
-              {TOOL_SHORT_LABELS[t]}
+            <Toggle key={t} value={t} className="tool-toggle" aria-label={TOOL_LABELS[t]} title={TOOL_LABELS[t]}>
+              <ToolIcon tool={t} size="1rem" />
             </Toggle>
           ))}
         </ToggleGroup>

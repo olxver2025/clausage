@@ -10,6 +10,10 @@ import { runBlocks } from './commands/blocks.js';
 import { runSummary } from './commands/summary.js';
 import { runPricing } from './commands/pricing.js';
 import { runWeb } from './commands/web.js';
+import { runSync } from './commands/sync.js';
+import { runStatusline } from './commands/statusline.js';
+import { runExport } from './commands/export.js';
+import { runMcp } from './commands/mcp.js';
 
 function version(): string {
   try {
@@ -23,7 +27,8 @@ function version(): string {
 const GLOBAL_HELP = `
 Usage: clausage [command] [options]
 
-Track token usage, cost and time across Claude Code, Codex, Grok Build and OpenCode.
+Track token usage, cost and time across Claude Code, Codex, Grok Build, OpenCode, Hermes Agent,
+OpenClaw, Pi, Gemini CLI, Amp, Qwen Code, Copilot CLI and Aider.
 
 Commands:
   daily              Usage per day (default)
@@ -37,12 +42,19 @@ Commands:
   summary            Dashboard: today / this week / this month, per tool, top models
   pricing <model>    Show the resolved LiteLLM price for a model
   web                Start the local web dashboard (--port, default 3456)
+  sync               Combine usage from several computers through a shared folder
+  statusline         One-line limits and spend for Claude Code's status line, tmux or a prompt
+  export             Every usage event as CSV (default), TSV, JSON Lines or JSON
+  mcp                Run an MCP server on stdio (usage, limits, spend, cache, spikes)
 
 Options:
   -s, --since <date>        Start date, YYYYMMDD or YYYY-MM-DD (inclusive)
   -u, --until <date>        End date (inclusive)
-  -t, --tool <list>         claude,codex,grok,opencode (aliases: claude-code, cc, oc); repeatable
+  -t, --tool <list>         claude,codex,grok,opencode,hermes,openclaw,pi,gemini,amp,qwen,
+                            copilot,aider; repeatable
+      --local               Only this computer (ignore other computers in the sync folder)
   -j, --json                Print the report as JSON
+  -f, --format <fmt>        table (default), json, csv, tsv or jsonl
   -b, --breakdown           Per-model sub-rows
   -m, --mode <mode>         Cost mode: auto (default; recorded cost when present), calculate, display
   -O, --offline             Use cached / embedded pricing, never fetch
@@ -101,6 +113,60 @@ clone of the repository, and prints its URL. Ctrl+C stops it.
 
   -P, --port <n>          Port to listen on (default 3456)
 `,
+  sync: `
+Usage: clausage sync [--folder <dir|off>] [--name <name>] [--json]
+
+First run clausage sync init-key on one computer. Transfer the key file privately and run
+clausage sync import-key <file> on the others. Keep it outside the shared folder.
+
+Combines encrypted usage snapshots from several computers. Point every computer at the same folder that iCloud Drive,
+Dropbox, Syncthing or a network share keeps in sync. Each one writes its token counts and metadata
+there (never prompt or response text); reports and the dashboard then add up all computers and
+group sessions and projects by computer. Running it also refreshes this computer's snapshot.
+
+  --folder <dir>          Set the shared folder ("off" turns sync off)
+  --name <name>           Rename this computer (default: its host name)
+`,
+  statusline: `
+Usage: clausage statusline [options]
+
+Prints one line: 5-hour and weekly limit use, time to reset, a warning when the pace reaches the
+limit before the reset, today's spend and (from Claude Code) the current session's cost.
+
+Claude Code: add to ~/.claude/settings.json
+  "statusLine": { "type": "command", "command": "clausage statusline" }
+Claude Code pipes session JSON on stdin; the line then shows Claude Code's own limits (use -t to
+choose other tools). Without stdin it covers every tool with limits.
+
+  --cache <seconds>       Reuse figures this long (default 30; 0 = always recompute)
+  -t, --tool <list>       Tools to show
+  -j, --json              Print the figures as JSON
+  --no-color              Plain text (colour is on by default, also when piped)
+`,
+  export: `
+Usage: clausage export [options] > usage.csv
+
+Every normalised usage event (one billable response) with timestamp, tool, computer, session,
+project, model, service tier, token counts and cost. No prompt or response text exists at this
+level. Historical aggregates (no per-event detail) are not included.
+
+  -f, --format <fmt>      csv (default), tsv, jsonl or json
+  -s/-u, -t, -p           The usual date, tool and project filters
+  -o, --order desc        Newest first
+`,
+  mcp: `
+Usage: clausage mcp [options]
+
+Model Context Protocol server on stdio. Tools: get_usage_report, get_limits, get_spend_summary,
+get_cache_efficiency, find_spikes. Read-only. Global options (--offline, --tool, --local,
+--timezone, --mode) set the defaults for every call.
+
+  Claude Code:  claude mcp add clausage -- clausage mcp
+  Codex:        add to ~/.codex/config.toml
+                [mcp_servers.clausage]
+                command = "clausage"
+                args = ["mcp"]
+`,
   summary: `
 Usage: clausage summary [options]
 
@@ -119,7 +185,9 @@ async function main(): Promise<number> {
     return 2;
   }
   if (opts.color !== undefined) setColor(opts.color);
-  if (opts.json) setColor(false);
+  // Status bars render ANSI colour even though stdout is a pipe.
+  else if (opts.command === 'statusline' && !(process.env.NO_COLOR ?? '')) setColor(true);
+  if (opts.json || opts.format !== 'table' || opts.command === 'mcp' || opts.command === 'export') setColor(false);
   if (opts.version) {
     process.stdout.write(version() + '\n');
     return 0;
@@ -153,6 +221,14 @@ async function main(): Promise<number> {
       break;
     case 'web':
       return runWeb(opts);
+    case 'sync':
+      return runSync(opts);
+    case 'statusline':
+      return runStatusline(opts);
+    case 'export':
+      return runExport(opts);
+    case 'mcp':
+      return runMcp(opts);
     case 'help':
       process.stdout.write(GLOBAL_HELP + '\n');
       break;

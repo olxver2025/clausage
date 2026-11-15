@@ -56,3 +56,27 @@ test("an empty table says so", () => {
   render(<DataTable caption="Models" columns={columns} rows={[]} emptyMessage="Nothing here." />);
   expect(screen.getByText("Nothing here.")).toBeTruthy();
 });
+
+test("only models with recorded fast usage expose the mode breakdown", async () => {
+  const { modeDetails } = await import("../models-projects/mode-breakdown");
+  const part = { tool: "codex" as const, model: "A", events: 1, inputTokens: 20, outputTokens: 0,
+    reasoningTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, totalTokens: 20, costUSD: 1 };
+  const parts = [undefined, "standard", "ultrafast"].map((speed) => ({ ...part, speed }));
+  const plain = modeDetails("B", [...parts.slice(0, 2), { ...part, speed: "fast", events: 0 }]);
+  const user = userEvent.setup();
+  render(<DataTable caption="Models" columns={columns} rows={[
+    { id: "a", cells: { model: "A", cost: "$3" }, modeDetails: modeDetails("A", parts) },
+    { id: "b", cells: { model: "B" }, modeDetails: plain },
+  ]} />);
+  expect(screen.queryByRole("button", { name: "Usage by mode for B" })).toBeNull();
+  const toggle = screen.getByRole("button", { name: "Usage by mode for A" });
+  expect(toggle.querySelector("svg[aria-hidden=true]")).toBeTruthy();
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  await user.click(toggle);
+  const details = screen.getByRole("table", { name: "A usage by mode" });
+  for (const name of ["Standard", "Ultrafast", "Unreported"]) {
+    expect(within(details).getByRole("rowheader", { name })).toBeTruthy();
+  }
+  await user.keyboard("{Enter}");
+  expect(screen.queryByRole("table", { name: "A usage by mode" })).toBeNull();
+});

@@ -23,6 +23,12 @@ export interface BlockSummary {
   projectedTokens: number | null;
   projectedCost: number | null;
   remainingMinutes: number | null;
+  /** the block is the provider's reported limit window */
+  anchored: boolean;
+  /** % of the 5-hour limit, when known */
+  limitPercent: number | null;
+  limitSource: "reported" | "configured" | null;
+  limitHit: boolean;
 }
 
 export function summarizeBlocks(report: Report): BlockSummary[] {
@@ -53,6 +59,10 @@ export function summarizeBlocks(report: Report): BlockSummary[] {
       projectedTokens: meta.projection?.totalTokens ?? null,
       projectedCost: meta.projection?.totalCost ?? null,
       remainingMinutes: meta.projection?.remainingMinutes ?? null,
+      anchored: meta.anchored === true,
+      limitPercent: meta.limit?.percent ?? null,
+      limitSource: meta.limit?.percent !== undefined ? meta.limit.source : null,
+      limitHit: meta.limit?.hit === true,
     });
   }
   return out.sort((a, b) => b.startMs - a.startMs || a.tool.localeCompare(b.tool));

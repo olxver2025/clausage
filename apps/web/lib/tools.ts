@@ -1,12 +1,33 @@
 import type { ToolId } from "@clausage/core";
 
-export const TOOL_IDS = ["claude-code", "codex", "grok", "opencode"] as const satisfies readonly ToolId[];
+export const TOOL_IDS = [
+  "claude-code",
+  "codex",
+  "grok",
+  "opencode",
+  "hermes",
+  "openclaw",
+  "pi",
+  "gemini",
+  "amp",
+  "qwen",
+  "copilot",
+  "aider",
+] as const satisfies readonly ToolId[];
 
 export const TOOL_LABELS: Record<ToolId, string> = {
   "claude-code": "Claude Code",
   codex: "Codex",
   grok: "Grok Build",
   opencode: "OpenCode",
+  hermes: "Hermes Agent",
+  openclaw: "OpenClaw",
+  pi: "Pi",
+  gemini: "Gemini CLI",
+  amp: "Amp",
+  qwen: "Qwen Code",
+  copilot: "Copilot CLI",
+  aider: "Aider",
 };
 
 export const TOOL_SHORT_LABELS: Record<ToolId, string> = {
@@ -14,6 +35,14 @@ export const TOOL_SHORT_LABELS: Record<ToolId, string> = {
   codex: "Codex",
   grok: "Grok",
   opencode: "OpenCode",
+  hermes: "Hermes",
+  openclaw: "OpenClaw",
+  pi: "Pi",
+  gemini: "Gemini",
+  amp: "Amp",
+  qwen: "Qwen",
+  copilot: "Copilot",
+  aider: "Aider",
 };
 
 export const TOOL_COLOR_VARS: Record<ToolId, string> = {
@@ -21,6 +50,14 @@ export const TOOL_COLOR_VARS: Record<ToolId, string> = {
   codex: "--tool-codex",
   grok: "--tool-grok",
   opencode: "--tool-opencode",
+  hermes: "--tool-hermes",
+  openclaw: "--tool-openclaw",
+  pi: "--tool-pi",
+  gemini: "--tool-gemini",
+  amp: "--tool-amp",
+  qwen: "--tool-qwen",
+  copilot: "--tool-copilot",
+  aider: "--tool-aider",
 };
 
 export function toolColor(tool: ToolId): string {
@@ -40,6 +77,23 @@ const ALIASES: Record<string, ToolId> = {
   "grok-build": "grok",
   opencode: "opencode",
   oc: "opencode",
+  hermes: "hermes",
+  "hermes-agent": "hermes",
+  openclaw: "openclaw",
+  clawdbot: "openclaw",
+  moltbot: "openclaw",
+  pi: "pi",
+  "pi-agent": "pi",
+  gemini: "gemini",
+  "gemini-cli": "gemini",
+  amp: "amp",
+  ampcode: "amp",
+  qwen: "qwen",
+  "qwen-code": "qwen",
+  copilot: "copilot",
+  "copilot-cli": "copilot",
+  "github-copilot": "copilot",
+  aider: "aider",
 };
 
 export function parseToolId(value: string): ToolId | undefined {

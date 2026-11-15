@@ -1,4 +1,6 @@
 import type {
+  LimitHit,
+  LimitSnapshot,
   CostMode,
   DailyAggregate,
   LoadOptions,
@@ -14,13 +16,29 @@ import { claudeCodeParser } from './parsers/claude-code.js';
 import { codexParser } from './parsers/codex.js';
 import { grokParser } from './parsers/grok.js';
 import { opencodeParser } from './parsers/opencode.js';
+import { hermesParser } from './parsers/hermes.js';
+import { openclawParser, piParser } from './parsers/openclaw.js';
+import { geminiParser } from './parsers/gemini.js';
+import { ampParser } from './parsers/amp.js';
+import { qwenParser } from './parsers/qwen.js';
+import { copilotParser } from './parsers/copilot.js';
+import { aiderParser } from './parsers/aider.js';
 import { applyCosts, costForAggregate, loadPricing, type PricingTable } from './pricing.js';
+import { readRemoteSnapshots, type SyncConfig } from './sync.js';
 
 export const PARSERS: Record<ToolId, ToolParser> = {
   'claude-code': claudeCodeParser,
   codex: codexParser,
   grok: grokParser,
   opencode: opencodeParser,
+  hermes: hermesParser,
+  openclaw: openclawParser,
+  pi: piParser,
+  gemini: geminiParser,
+  amp: ampParser,
+  qwen: qwenParser,
+  copilot: copilotParser,
+  aider: aiderParser,
 };
 
 export interface LoadUsageOptions extends LoadOptions {
@@ -45,6 +63,22 @@ export interface LoadUsageOptions extends LoadOptions {
    * so cost modes and filters never leak between calls.
    */
   parseCache?: Map<ToolId, Promise<ParseResult>>;
+  /**
+   * Multi-computer sync. Local events and sessions are tagged with `machineName`, and when a folder
+   * is set every other computer's snapshot in it is merged in (tagged with its own name).
+   */
+  sync?: SyncConfig;
+  /** only these computers (by name); default all */
+  machines?: string[];
+}
+
+export interface MachineInfo {
+  name: string;
+  /** this computer */
+  local: boolean;
+  /** epoch ms of the snapshot (remote machines only) */
+  exportedAt?: number;
+  tools: ToolId[];
 }
 
 export interface LoadUsageResult {
@@ -54,6 +88,37 @@ export interface LoadUsageResult {
   pricing: PricingTable;
   sources: Record<ToolId, string[]>;
   warnings: string[];
+  /** computers in the load (just this one unless sync is set up) */
+  machines: MachineInfo[];
+  /** usage-limit snapshots reported by the tools (all time, oldest first) */
+  limits: LimitSnapshot[];
+  /** requests refused for a usage limit (all time, oldest first) */
+  limitHits: LimitHit[];
+}
+
+/** Raw (unfiltered, uncosted) parses for the given tools, sharing `parseCache` when given. */
+export async function parseTools(
+  tools: readonly ToolId[],
+  opts: { paths?: LoadOptions['paths']; parseCache?: Map<ToolId, Promise<ParseResult>>; warn?: (m: string) => void } = {},
+): Promise<ParseResult[]> {
+  const warn = opts.warn ?? (() => {});
+  const settled = await Promise.allSettled(
+    tools.filter((t) => t in PARSERS).map((t) => {
+      const cache = opts.parseCache;
+      if (!cache) return PARSERS[t].load({ paths: opts.paths, warn });
+      let p = cache.get(t);
+      if (!p) {
+        const parseWarnings: string[] = [];
+        p = PARSERS[t].load({ paths: opts.paths, warn: (m) => parseWarnings.push(m) }).then((r) => Object.assign(r, { parseWarnings }));
+        cache.set(t, p);
+        p.catch(() => {
+          if (cache.get(t) === p) cache.delete(t);
+        });
+      }
+      return p;
+    }),
+  );
+  return settled.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
 }
 
 
@@ -71,7 +136,7 @@ export async function loadUsage(opts: LoadUsageOptions = {}): Promise<LoadUsageR
     warnings.push(m);
     opts.warn?.(m);
   };
-  const tools = (opts.tools && opts.tools.length ? opts.tools : [...TOOL_IDS]).filter((t, i, a) => a.indexOf(t) === i);
+  const tools = (opts.tools && opts.tools.length ? opts.tools : [...TOOL_IDS]).filter((t, i, a) => a.indexOf(t) === i && t in PARSERS);
   const parserOpts: LoadOptions = { paths: opts.paths, since: opts.since, until: opts.until, warn };
 
   const pricingPromise = loadPricing({
@@ -116,6 +181,45 @@ export async function loadUsage(opts: LoadUsageOptions = {}): Promise<LoadUsageR
     }
   });
 
+  // Tag this computer's data, then merge the other computers' snapshots (copies, so the shared
+  // snapshot cache is never mutated by project attribution or costing).
+  const machines: MachineInfo[] = [];
+  const sync = opts.sync;
+  if (sync) {
+    const localName = sync.machineName;
+    for (const r of results) {
+      for (const e of r.events) e.machine = localName;
+      for (const s of r.sessions) s.machine = localName;
+      r.limits = (r.limits ?? []).map((l) => ({ ...l, machine: localName }));
+      r.limitHits = (r.limitHits ?? []).map((h) => ({ ...h, machine: localName }));
+      r.historical = (r.historical ?? []).map((h) => ({ ...h, machine: localName }));
+    }
+    machines.push({ name: localName, local: true, tools: results.filter((r) => r.events.length || r.historical?.length).map((r) => r.tool) });
+    const taken = new Set([localName]);
+    for (const snap of readRemoteSnapshots(sync, warn)) {
+      // Two computers with the same display name stay apart.
+      let name = snap.machineName;
+      for (let i = 2; taken.has(name); i++) name = `${snap.machineName} (${i})`;
+      taken.add(name);
+      machines.push({ name, local: false, exportedAt: snap.exportedAt, tools: snap.tools });
+      for (const r of snap.results) {
+        if (!tools.includes(r.tool)) continue;
+        results.push({
+          ...r,
+          sources: [],
+          events: r.events.map((e) => ({ ...e, machine: name, costUSD: 0, costUnknown: undefined })),
+          sessions: r.sessions.map((s) => ({ ...s, machine: name })),
+          historical: (r.historical ?? []).map((h) => ({ ...h, machine: name, costUSD: undefined, costUnknown: undefined })),
+          limits: (r.limits ?? []).map((l) => ({ ...l, machine: name })),
+          limitHits: (r.limitHits ?? []).map((h) => ({ ...h, machine: name })),
+        });
+      }
+    }
+  }
+  const machineSet = opts.machines?.length ? new Set(opts.machines) : undefined;
+  const machineOk = (m: string | undefined) => !machineSet || machineSet.has(m ?? '');
+  const mkey = (m: string | undefined) => m ?? '';
+
   const since = opts.since;
   const until = opts.until;
   const inRange = (ts: number) => (since === undefined || ts >= since) && (until === undefined || ts <= until);
@@ -129,18 +233,18 @@ export async function loadUsage(opts: LoadUsageOptions = {}): Promise<LoadUsageR
   for (const r of results) {
     for (const s of r.sessions) {
       if (!s.project) continue;
-      const k = `${s.tool}:${s.sessionId}`;
+      const k = `${mkey(s.machine)}|${s.tool}:${s.sessionId}`;
       if (!s.isSubagent || !rootProject.has(k)) rootProject.set(k, s.project);
     }
   }
   for (const r of results) {
     for (const e of r.events) {
-      const p = rootProject.get(`${e.tool}:${e.rootSessionId || e.sessionId}`);
+      const p = rootProject.get(`${mkey(e.machine)}|${e.tool}:${e.rootSessionId || e.sessionId}`);
       if (p) e.project = p;
     }
     for (const s of r.sessions) {
       if (!s.isSubagent || !s.rootSessionId) continue;
-      const p = rootProject.get(`${s.tool}:${s.rootSessionId}`);
+      const p = rootProject.get(`${mkey(s.machine)}|${s.tool}:${s.rootSessionId}`);
       if (p) s.project = p;
     }
   }
@@ -155,6 +259,7 @@ export async function loadUsage(opts: LoadUsageOptions = {}): Promise<LoadUsageR
       if (!Number.isFinite(e.timestamp) || !inRange(e.timestamp)) continue;
       if (!includeSub && e.isSubagent) continue;
       if (!projectOk(e.project)) continue;
+      if (!machineOk(e.machine)) continue;
       events.push(e);
     }
   }
@@ -165,10 +270,11 @@ export async function loadUsage(opts: LoadUsageOptions = {}): Promise<LoadUsageR
   const sessions: SessionInfo[] = [];
   for (const r of results) {
     for (const s of r.sessions) {
-      const k = `${s.tool}:${s.sessionId}`;
+      const k = `${mkey(s.machine)}|${s.tool}:${s.sessionId}`;
       if (seenSess.has(k)) continue;
       seenSess.add(k);
       if (!includeSub && s.isSubagent) continue;
+      if (!machineOk(s.machine)) continue;
       if (!projectOk(s.project)) continue;
       if (since !== undefined && Number.isFinite(s.endedAt) && s.endedAt < since) continue;
       if (until !== undefined && Number.isFinite(s.startedAt) && s.startedAt > until) continue;
@@ -179,7 +285,7 @@ export async function loadUsage(opts: LoadUsageOptions = {}): Promise<LoadUsageR
   // historical: UTC days; drop days already covered by events of the same tool
   const covered = new Set<string>();
   if (!opts.keepOverlappingHistorical) {
-    for (const r of results) for (const e of r.events) covered.add(`${e.tool}:${utcDay(e.timestamp)}`);
+    for (const r of results) for (const e of r.events) covered.add(`${mkey(e.machine)}|${e.tool}:${utcDay(e.timestamp)}`);
   }
   const historical: DailyAggregate[] = [];
   const sinceDay = since !== undefined ? dateKey(since, opts.timezone) : undefined;
@@ -194,7 +300,8 @@ export async function loadUsage(opts: LoadUsageOptions = {}): Promise<LoadUsageR
         if (!/^\d{4}-\d{2}-\d{2}$/.test(h.date)) continue;
         if (sinceDay !== undefined && h.date < sinceDay) continue;
         if (untilDay !== undefined && h.date > untilDay) continue;
-        if (covered.has(`${h.tool}:${h.date}`)) continue;
+        if (covered.has(`${mkey(h.machine)}|${h.tool}:${h.date}`)) continue;
+        if (!machineOk(h.machine)) continue;
         historical.push({ ...h });
       }
     }
@@ -223,5 +330,15 @@ export async function loadUsage(opts: LoadUsageOptions = {}): Promise<LoadUsageR
     }
   }
 
-  return { events, sessions, historical, pricing, sources, warnings };
+  // Limits are account-wide and needed beyond the date range (the current window, capacity history).
+  const limits: LimitSnapshot[] = [];
+  const limitHits: LimitHit[] = [];
+  for (const r of results) {
+    for (const l of r.limits ?? []) if (machineOk(l.machine)) limits.push(l);
+    for (const h of r.limitHits ?? []) if (machineOk(h.machine)) limitHits.push(h);
+  }
+  limits.sort((a, b) => a.timestamp - b.timestamp);
+  limitHits.sort((a, b) => a.timestamp - b.timestamp);
+
+  return { events, sessions, historical, pricing, sources, warnings, machines, limits, limitHits };
 }

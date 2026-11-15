@@ -18,30 +18,37 @@
  * outputTokens = output, reasoningTokens informational.
  *
  * PRIVACY: only metadata and numbers are extracted. Message text, instructions, tool
- * arguments/outputs and credit balances are never read into results. Titles (from the state
+ * arguments/outputs and credit balances are never read into results; of a tool call only its
+ * name (and MCP namespace) is kept. Titles (from the state
  * SQLite `threads.title` or session_index.jsonl `thread_name`) are kept as session titles.
  */
 import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { readCodexUsageHistory } from '../codex-usage.js';
 import type {
   LoadOptions,
   ParseResult,
   SessionInfo,
   ToolParser,
-  UsageEvent,
-} from '../types.js';
+  UsageEvent, LimitHit, LimitSnapshot, LimitWindow } from '../types.js';
 import {
   computeActiveMs,
+  countToolCall,
   envPaths,
   exists,
   homeDir,
+  mapLimit,
   normalizePath,
   readJsonlFile,
   toEpochMs,
+  toolCallName,
+  toolCallsRecord,
   walkFiles,
 } from './util.js';
 
 const TOOL = 'codex' as const;
+/** rollout files parsed at once (bounds peak memory: some are tens of MB of text) */
+const READ_CONCURRENCY = 4;
 const ROLLOUT_RE = /^rollout-.*\.jsonl(\.zst)?$/i;
 const UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(?:\.zst)?$/i;
 const TOOL_CALL_TYPES = new Set([
@@ -53,6 +60,27 @@ const TOOL_CALL_TYPES = new Set([
 ]);
 
 type Obj = Record<string, unknown>;
+
+/** Item types that carry no name field: the type itself names the built-in tool. */
+const UNNAMED_CALL_NAMES: Record<string, string> = {
+  local_shell_call: 'local_shell',
+  web_search_call: 'web_search',
+  tool_search_call: 'tool_search',
+};
+
+/**
+ * The name of a tool-call response item. MCP tools are recorded as `name` within an
+ * `mcp__<server>` namespace and are reported as `mcp__<server>__<tool>`, as Claude Code names them.
+ */
+function codexToolName(type: string, p: Obj): string | undefined {
+  const name = toolCallName(p.name);
+  if (!name) return UNNAMED_CALL_NAMES[type];
+  const ns = toolCallName(p.namespace);
+  if (ns && ns.startsWith('mcp__') && !name.startsWith('mcp__')) {
+    return toolCallName(ns.endsWith('__') ? ns + name : `${ns}__${name}`);
+  }
+  return name;
+}
 
 interface Usage {
   input: number;
@@ -235,6 +263,7 @@ export function parseCodexRolloutLines(
   let sawItemCompleted = false;
   let sawLegacyMsg = false;
   let toolCalls = 0;
+  const toolNames = new Map<string, number>();
   const seenCallIds = new Set<string>();
   const contextModels = new Set<string>();
 
@@ -262,7 +291,8 @@ export function parseCodexRolloutLines(
     tmeta?.model ??
     'unknown';
 
-  const pushEvent = (id: string, ts: number, u: Usage, model: string) => {
+  const recordTier = (p: Obj) => str(isObj(p.usage) ? p.usage.service_tier : undefined) ?? str(p.service_tier);
+  const pushEvent = (id: string, ts: number, u: Usage, model: string, speed = serviceTier) => {
     if (isEmptyUsage(u)) return;
     const cacheRead = u.cached;
     const cacheWrite = u.cacheWrite;
@@ -284,7 +314,7 @@ export function parseCodexRolloutLines(
       costUSD: 0,
     };
     if (provider) ev.provider = provider;
-    if (serviceTier && serviceTier !== 'default' && serviceTier !== 'auto') ev.speed = serviceTier;
+    if (speed) ev.speed = speed;
     events.push(ev);
   };
 
@@ -298,6 +328,7 @@ export function parseCodexRolloutLines(
 
     // Model/cwd tracking happens for copied lines too (they precede our own turns).
     if (l.type === 'turn_context') {
+      if (own && 'service_tier' in p) serviceTier = str(p.service_tier);
       curModel = str(p.model) ?? curModel;
       curCwd = str(p.cwd) ?? curCwd;
       if (own && str(p.turn_id)) curTurn = str(p.turn_id);
@@ -307,7 +338,7 @@ export function parseCodexRolloutLines(
     } else if (l.type === 'event_msg' && ptype === 'thread_settings_applied' && isObj(p.thread_settings)) {
       settingsModel = str(p.thread_settings.model) ?? settingsModel;
       const tier = str(p.thread_settings.service_tier);
-      if (tier) serviceTier = tier;
+      if (own && (!p.thread_id || p.thread_id === threadId)) serviceTier = tier;
     }
 
     if (!own) {
@@ -335,7 +366,7 @@ export function parseCodexRolloutLines(
           if (ctx.seenResponseIds.has(rid)) break;
           ctx.seenResponseIds.add(rid);
         }
-        pushEvent(rid ? `codex:${rid}` : `codex:${threadId}:rec:${o}`, ts, u, resolveModel(str(p.turn_id)));
+        pushEvent(rid ? `codex:${rid}` : `codex:${threadId}:rec:${o}`, ts, u, resolveModel(str(p.turn_id)), recordTier(p));
         break;
       }
       case 'compacted': {
@@ -356,7 +387,7 @@ export function parseCodexRolloutLines(
           : undefined;
         const tidTurn = str(rec.turn_id);
         const model = (tidTurn ? turnModel.get(tidTurn) : undefined) ?? prevModel ?? resolveModel();
-        pushEvent(`codex:${cid}`, ts, u, model);
+        pushEvent(`codex:${cid}`, ts, u, model, recordTier(rec));
         break;
       }
       case 'response_item': {
@@ -367,6 +398,7 @@ export function parseCodexRolloutLines(
             seenCallIds.add(cid);
           }
           toolCalls++;
+          countToolCall(toolNames, codexToolName(ptype, p));
         } else if (ptype === 'message') {
           if (p.role === 'user') respUser++;
           else if (p.role === 'assistant') respAgent++;
@@ -417,7 +449,7 @@ export function parseCodexRolloutLines(
             const total = readUsage(p.info.total_token_usage);
             const last = readUsage(p.info.last_token_usage);
             if (!total) {
-              if (last && started && emit) pushEvent(`codex:${threadId}:tc:${o}`, ts, last, resolveModel());
+              if (last && started && emit) pushEvent(`codex:${threadId}:tc:${o}`, ts, last, resolveModel(), recordTier(p.info) ?? str(p.service_tier));
               break;
             }
             if (!started) {
@@ -435,7 +467,7 @@ export function parseCodexRolloutLines(
             }
             prevTotal = total;
             if (!emit) break;
-            pushEvent(`codex:${threadId}:tc:${o}`, ts, delta, resolveModel());
+            pushEvent(`codex:${threadId}:tc:${o}`, ts, delta, resolveModel(), recordTier(p.info) ?? str(p.service_tier));
             break;
           }
         }
@@ -466,6 +498,8 @@ export function parseCodexRolloutLines(
     turns: turnIds.size + anonTurns,
     models,
   };
+  const byName = toolCallsRecord(toolNames);
+  if (byName) session.toolCallsByName = byName;
   if (tmeta?.title) session.title = tmeta.title;
   const version = str(meta.cli_version);
   if (version) session.version = version;
@@ -500,6 +534,11 @@ function slimLine(v: unknown): unknown {
   switch (v.type) {
     case 'response_item':
       payload = { type: p.type, role: p.role, call_id: p.call_id, id: p.id };
+      // tool calls: keep the tool's name (never its arguments, input or output)
+      if (typeof p.type === 'string' && TOOL_CALL_TYPES.has(p.type)) {
+        payload.name = toolCallName(p.name);
+        payload.namespace = toolCallName(p.namespace);
+      }
       break;
     case 'turn_context':
       payload = {
@@ -553,7 +592,7 @@ async function readLines(file: string): Promise<unknown[]> {
   const st = await stat(file);
   const hit = lineCache.get(file);
   if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.lines;
-  const lines = readJsonlFile(file).then((values) => values.map(slimLine));
+  const lines = readJsonlFile(file, slimLine);
   lineCache.set(file, { size: st.size, mtimeMs: st.mtimeMs, lines });
   lines.catch(() => {
     if (lineCache.get(file)?.lines === lines) lineCache.delete(file);
@@ -659,10 +698,12 @@ async function load(opts: LoadOptions): Promise<ParseResult> {
     }
   }
 
-  const jobs: Array<Promise<{ lines: unknown[]; fileId?: string }>> = [];
+  // Rollouts are read a few at a time: each one's full text and parsed lines (before slimming) are
+  // large, and reading them all at once held every file in memory together.
+  const jobs: Array<() => Promise<{ lines: unknown[]; fileId?: string }>> = [];
   for (const [id, files] of groups) {
     jobs.push(
-      (async () => {
+      async () => {
         if (files.length === 1) return { lines: await readLines(files[0]!), fileId: id };
         // Same rollout in several places (live .jsonl vs compressed .zst vs archived): keep the
         // most complete copy (most lines, then newest mtime).
@@ -679,12 +720,17 @@ async function load(opts: LoadOptions): Promise<ParseResult> {
           }
         }
         return { lines: best?.lines ?? [], fileId: id };
-      })(),
+      },
     );
   }
-  for (const f of anonymous) jobs.push(readLines(f).then((lines) => ({ lines })));
+  for (const f of anonymous) jobs.push(() => readLines(f).then((lines) => ({ lines })));
 
-  const settled = await Promise.allSettled(jobs);
+  const settled = await mapLimit(jobs, READ_CONCURRENCY, (job) =>
+    job().then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    ),
+  );
   // Deterministic processing order (dedupe keeps the first): sort by thread id.
   const parsed = settled
     .flatMap((s) => {
@@ -704,7 +750,59 @@ async function load(opts: LoadOptions): Promise<ParseResult> {
     result.sessions.push(r.session);
   }
   result.events.sort((a, b) => a.timestamp - b.timestamp);
+  const { limits, limitHits } = collectRateLimits(parsed.map((p) => p.lines));
+  result.limits = [...limits, ...(opts.paths?.codex?.length ? [] : readCodexUsageHistory())].sort((a, b) => a.timestamp - b.timestamp);
+  result.limitHits = limitHits;
   return result;
+}
+
+function toLimitWindow(v: unknown): LimitWindow | undefined {
+  if (!isObj(v) || typeof v.used_percent !== 'number' || typeof v.window_minutes !== 'number' || typeof v.resets_at !== 'number') return undefined;
+  return { usedPercent: v.used_percent, windowMinutes: v.window_minutes, resetsAt: v.resets_at * 1000 };
+}
+
+/**
+ * Every rate-limit snapshot (from token_count events) across all rollouts, keeping only the ones
+ * that changed something, plus the moments Codex reported a limit as reached.
+ */
+function collectRateLimits(files: unknown[][]): { limits: LimitSnapshot[]; limitHits: LimitHit[] } {
+  const all: LimitSnapshot[] = [];
+  const hits: LimitHit[] = [];
+  for (const lines of files) {
+    for (const v of lines) {
+      if (!isObj(v) || v.type !== 'event_msg') continue;
+      const p = isObj(v.payload) ? v.payload : null;
+      if (!p || p.type !== 'token_count' || !isObj(p.rate_limits)) continue;
+      const rl = p.rate_limits;
+      // Codex reports several limit buckets; the 'codex' one (or an unnamed one) carries the usage windows.
+      if (rl.limit_id !== undefined && rl.limit_id !== null && rl.limit_id !== 'codex') continue;
+      const ts = toEpochMs(v.timestamp);
+      if (!Number.isFinite(ts)) continue;
+      const reached = str(rl.rate_limit_reached_type);
+      if (reached) hits.push({ tool: TOOL, timestamp: ts, kind: reached });
+      const primary = toLimitWindow(rl.primary);
+      const secondary = toLimitWindow(rl.secondary);
+      if (!primary && !secondary) continue;
+      all.push({ tool: TOOL, timestamp: ts, ...(primary ? { primary } : {}), ...(secondary ? { secondary } : {}), ...(str(rl.plan_type) ? { planType: str(rl.plan_type) } : {}) });
+    }
+  }
+  all.sort((a, b) => a.timestamp - b.timestamp);
+  const limits: LimitSnapshot[] = [];
+  const same = (a?: LimitWindow, b?: LimitWindow) => a?.usedPercent === b?.usedPercent && a?.resetsAt === b?.resetsAt;
+  for (const s of all) {
+    const prev = limits[limits.length - 1];
+    if (prev && same(prev.primary, s.primary) && same(prev.secondary, s.secondary) && prev.planType === s.planType) continue;
+    limits.push(s);
+  }
+  // A limit stays "reached" across many responses; keep one hit per reset window and kind.
+  hits.sort((a, b) => a.timestamp - b.timestamp);
+  const limitHits: LimitHit[] = [];
+  for (const h of hits) {
+    const prev = limitHits[limitHits.length - 1];
+    if (prev && prev.kind === h.kind && h.timestamp - prev.timestamp < 60 * 60_000) continue;
+    limitHits.push(h);
+  }
+  return { limits, limitHits };
 }
 
 export const codexParser: ToolParser = {

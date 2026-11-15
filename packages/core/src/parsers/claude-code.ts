@@ -8,21 +8,21 @@
  *
  * PRIVACY: only metadata and numbers are read from records. Prompt / message text, `last-prompt`,
  * `api-request-blob` and similar records are never retained or emitted. Titles (custom-title,
- * summary, agent-name, desktop metadata title) are the only strings extracted.
+ * summary, agent-name, desktop metadata title) and tool_use block names are the only strings
+ * extracted; tool inputs and results are never read.
  */
-import { createReadStream } from 'node:fs';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { createInterface } from 'node:readline';
+import { readClaudeUsageHistory } from '../claude-usage.js';
 import type {
   DailyAggregate,
   LoadOptions,
   ParseResult,
   SessionInfo,
   ToolParser,
-  UsageEvent,
-} from '../types.js';
+  UsageEvent, LimitHit } from '../types.js';
+import { countToolCall, mapLimit, readJsonlFile, toolCallName, toolCallsRecord } from './util.js';
 
 const TOOL = 'claude-code' as const;
 const IDLE_MS = 5 * 60 * 1000;
@@ -68,19 +68,6 @@ async function walk(root: string, pred: (p: string) => boolean, out: string[] = 
     else if (e.isFile() && pred(full)) out.push(full);
   }
   return out;
-}
-
-async function* jsonLines(file: string): AsyncIterable<unknown> {
-  const rl = createInterface({ input: createReadStream(file, { encoding: 'utf8' }), crlfDelay: Infinity });
-  for await (const line of rl) {
-    const t = line.trim();
-    if (!t) continue;
-    try {
-      yield JSON.parse(t);
-    } catch {
-      // partial / invalid line (live file) - skip
-    }
-  }
 }
 
 function activeMsFrom(timestamps: number[], idleMs = IDLE_MS): number {
@@ -171,6 +158,8 @@ interface FileState {
   turns: number;
   assistantMessages: number;
   toolCalls: number;
+  /** tool calls per tool name (names only) */
+  toolNames: Map<string, number>;
   models: Set<string>;
   version?: string;
   title?: string;
@@ -212,15 +201,49 @@ interface ParsedFile {
   st: FileState;
   /** every usage line, including in-file duplicates; `dedupeKey` undefined when ids are missing */
   events: Array<{ ev: UsageEvent; dedupeKey?: string }>;
-  toolUses: Array<string | undefined>;
+  /** tool_use blocks: id (for dedupe) and tool name only */
+  toolUses: Array<{ id?: string; name?: string }>;
   lines: LineItem[];
   firstTs: number;
   lastTs: number;
   /** file creation time (0 if unknown); breaks ties between an original and its fork, which share firstTs */
   birthMs: number;
+  /** usage-limit refusals: API-error entries flagged as rate limits */
+  limitHits: Array<{ uuid?: string; ts: number; resetsAt?: number }>;
 }
 
-async function parseFile(file: string, projectsDir: string): Promise<ParsedFile | null> {
+// Parsed transcripts, reused while the file's size and mtime are unchanged. Finished sessions never
+// change, so a repeat load (long-running hosts such as the dashboard) only re-reads live files.
+const fileCache = new Map<string, { size: number; mtimeMs: number; projectsDir: string; parsed: ParsedFile | null }>();
+
+/** A copy that a load can mutate (session state, event attribution, costs) without touching the cache. */
+function cloneParsed(pf: ParsedFile | null): ParsedFile | null {
+  if (!pf) return null;
+  return {
+    ...pf,
+    st: { ...pf.st, timestamps: [], models: new Set(), toolNames: new Map() },
+    events: pf.events.map(({ ev, dedupeKey }) => ({ ev: { ...ev }, dedupeKey })),
+  };
+}
+
+async function parseFileCached(file: string, projectsDir: string): Promise<ParsedFile | null> {
+  const info = await stat(file);
+  const hit = fileCache.get(file);
+  if (hit && hit.size === info.size && hit.mtimeMs === info.mtimeMs && hit.projectsDir === projectsDir) {
+    return cloneParsed(hit.parsed);
+  }
+  const parsed = await parseFile(file, projectsDir, info.birthtimeMs || 0);
+  fileCache.set(file, { size: info.size, mtimeMs: info.mtimeMs, projectsDir, parsed });
+  return cloneParsed(parsed);
+}
+
+/** Forget cached transcripts under `dir` that are no longer on disk. */
+function pruneFileCache(dir: string, live: ReadonlySet<string>): void {
+  const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
+  for (const f of fileCache.keys()) if (f.startsWith(prefix) && !live.has(f)) fileCache.delete(f);
+}
+
+async function parseFile(file: string, projectsDir: string, birthMs: number): Promise<ParsedFile | null> {
   const fileName = path.basename(file);
   const agentMatch = AGENT_FILE_RE.exec(fileName);
   const fileAgentId = agentMatch?.[1];
@@ -241,21 +264,25 @@ async function parseFile(file: string, projectsDir: string): Promise<ParsedFile 
     turns: 0,
     assistantMessages: 0,
     toolCalls: 0,
+    toolNames: new Map(),
     models: new Set(),
   };
   let recordSessionId: string | undefined;
   let recordAgentId: string | undefined;
   const fileEvents: Array<{ ev: UsageEvent; dedupeKey?: string }> = [];
-  const toolUses: Array<string | undefined> = [];
+  const toolUses: ParsedFile['toolUses'] = [];
   const lines: LineItem[] = [];
+  const limitHits: ParsedFile['limitHits'] = [];
   let firstTs = Infinity;
   let lastTs = -Infinity;
   let lineNo = 0;
 
-  for await (const raw of jsonLines(file)) {
+  // Read in one go (awaiting each line costs a promise per line, which dominates on large transcripts),
+  // handling each line as it's parsed so the raw records (message text, tool output) are dropped at once.
+  await readJsonlFile(file, (raw) => {
     lineNo++;
     const rec = obj(raw);
-    if (!rec) continue;
+    if (!rec) return;
     const type = rec.type;
     if (!recordSessionId) recordSessionId = str(rec.sessionId);
     if (!recordAgentId) recordAgentId = str(rec.agentId);
@@ -274,39 +301,43 @@ async function parseFile(file: string, projectsDir: string): Promise<ParsedFile 
     if (type === 'custom-title') {
       const t = str(rec.customTitle) ?? str(rec.title);
       if (t) st.title = t;
-      continue;
+      return;
     }
     if (type === 'summary') {
       const t = str(rec.summary);
       if (t && !st.title) st.title = t;
-      continue;
+      return;
     }
     if (type === 'agent-name') {
       const t = str(rec.agentName);
       if (t) st.agentName = t;
-      continue;
+      return;
     }
     if (type === 'user') {
       if (isUserPrompt(rec)) item.prompt = rec.isSidechain === true ? 1 : 2;
-      continue;
+      return;
     }
-    if (type !== 'assistant') continue;
+    if (type !== 'assistant') return;
 
     const msg = obj(rec.message);
-    if (!msg) continue;
+    if (ts !== undefined) {
+      const hit = limitHitOf(rec, msg, ts);
+      if (hit) limitHits.push({ uuid: str(rec.uuid), ...hit });
+    }
+    if (!msg) return;
     // tool calls: content blocks are split across duplicate lines, so collect from every line
     if (Array.isArray(msg.content)) {
       for (const b of msg.content) {
         const block = obj(b);
         if (block?.type !== 'tool_use') continue;
-        toolUses.push(str(block.id));
+        toolUses.push({ id: str(block.id), name: toolCallName(block.name) });
       }
     }
     const usage = obj(msg.usage);
-    if (!usage) continue;
+    if (!usage) return;
     const model = str(msg.model);
-    if (!model || model === '<synthetic>') continue;
-    if (ts === undefined) continue;
+    if (!model || model === '<synthetic>') return;
+    if (ts === undefined) return;
 
     const msgId = str(msg.id);
     const reqId = str(rec.requestId);
@@ -353,7 +384,7 @@ async function parseFile(file: string, projectsDir: string): Promise<ParsedFile 
     if (ws) ev.webSearchRequests = ws;
 
     fileEvents.push({ ev, dedupeKey });
-  }
+  });
 
   const parentId = pathSessionId ?? recordSessionId;
   if (!parentId) return null;
@@ -367,20 +398,32 @@ async function parseFile(file: string, projectsDir: string): Promise<ParsedFile 
     ev.rootSessionId = parentId;
     if (!ev.project) ev.project = st.project;
   }
-  let birthMs = 0;
-  try {
-    birthMs = (await stat(file)).birthtimeMs || 0;
-  } catch {
-    // ignore
-  }
-  return { file, st, events: fileEvents, toolUses, lines, firstTs, lastTs, birthMs };
+  return { file, st, events: fileEvents, toolUses, lines, firstTs, lastTs, birthMs, limitHits };
+}
+
+// Claude Code writes a synthetic assistant entry when the API refuses a request for a usage limit.
+// Only that synthetic error text is ever inspected, and only to match these fixed formats.
+const LIMIT_TEXT = /^(?:Claude AI usage limit reached\|(\d{9,13})|.{0,40}\blimit reached\b.{0,60})$/i;
+
+function limitHitOf(rec: Record<string, unknown>, msg: Record<string, unknown> | undefined, ts: number): { ts: number; resetsAt?: number } | null {
+  if (rec.isApiErrorMessage !== true) return null;
+  if (rec.error === 'rate_limit' || num(rec.apiErrorStatus) === 429) return { ts };
+  if (!msg || str(msg.model) !== '<synthetic>' || !Array.isArray(msg.content)) return null;
+  const first = obj(msg.content[0]);
+  const text = first?.type === 'text' ? str(first.text) : undefined;
+  if (!text || text.length > 120) return null;
+  const m = LIMIT_TEXT.exec(text.trim());
+  if (!m) return null;
+  if (!m[1]) return { ts };
+  const n = Number(m[1]);
+  return { ts, resetsAt: n < 1e12 ? n * 1000 : n };
 }
 
 /**
  * Global dedupe, applied to files in chronological order (earliest record first) so that history
  * copied into a resumed / forked session file stays attributed to the session where it happened.
  * - requests: by `${message.id}:${requestId}` (ccusage key); first occurrence wins
- * - tool calls: by tool_use id
+ * - tool calls: by tool_use id (the same block is repeated on every line of a split response)
  * - session stats (timestamps, prompts): records copied verbatim carry the same `uuid`, so lines
  *   whose uuid was already seen are skipped (lines without uuid are always counted)
  */
@@ -397,12 +440,13 @@ function applyFile(pf: ParsedFile, ctx: ParseCtx): void {
       if (li.prompt === 2) st.userMessages++;
     }
   }
-  for (const id of pf.toolUses) {
+  for (const { id, name } of pf.toolUses) {
     if (id) {
       if (ctx.seenToolUses.has(id)) continue;
       ctx.seenToolUses.add(id);
     }
     st.toolCalls++;
+    countToolCall(st.toolNames, name);
   }
   for (const { ev, dedupeKey } of pf.events) {
     if (dedupeKey) {
@@ -546,14 +590,16 @@ async function load(opts: LoadOptions): Promise<ParseResult> {
       const b = path.basename(p).toLowerCase();
       return b.endsWith('.jsonl') && b !== 'journal.jsonl';
     });
-    for (const f of files) {
+    pruneFileCache(projects, new Set(files));
+    const results = await mapLimit(files, 16, async (f) => {
       try {
-        const pf = await parseFile(f, projects);
-        if (pf) parsed.push(pf);
+        return await parseFileCached(f, projects);
       } catch (e) {
         warn?.(`claude-code: failed to read ${f}: ${(e as Error).message}`);
+        return null;
       }
-    }
+    });
+    for (const pf of results) if (pf) parsed.push(pf);
   }
   // Chronological by first record. A fork / resumed copy shares the original's first timestamp, so
   // ties go to the file created first, then the one that ends first (the fork extends the copy),
@@ -587,6 +633,7 @@ async function load(opts: LoadOptions): Promise<ParseResult> {
     prev.turns += st.turns;
     prev.assistantMessages += st.assistantMessages;
     prev.toolCalls += st.toolCalls;
+    for (const [name, n] of st.toolNames) countToolCall(prev.toolNames, name, n);
     for (const m of st.models) prev.models.add(m);
     prev.project ||= st.project;
     prev.version ??= st.version;
@@ -619,6 +666,8 @@ async function load(opts: LoadOptions): Promise<ParseResult> {
       models: [...st.models].sort(),
     };
     const title = st.isSubagent ? (st.agentName ?? st.title) : (st.title ?? desktopTitles.get(st.sessionKey));
+    const byName = toolCallsRecord(st.toolNames);
+    if (byName) s.toolCallsByName = byName;
     if (title) s.title = title;
     if (st.version) s.version = st.version;
     sessions.push(s);
@@ -649,12 +698,28 @@ async function load(opts: LoadOptions): Promise<ParseResult> {
     }
   }
 
+  // Limit refusals, deduped by line uuid (resumed sessions copy earlier lines) and to one per hour.
+  const seenHit = new Set<string>();
+  const hitList = parsed
+    .flatMap((pf) => pf.limitHits ?? [])
+    .filter((h) => !h.uuid || (!seenHit.has(h.uuid) && seenHit.add(h.uuid)))
+    .sort((a, b) => a.ts - b.ts);
+  const limitHits: LimitHit[] = [];
+  for (const h of hitList) {
+    const prev = limitHits[limitHits.length - 1];
+    if (prev && h.ts - prev.timestamp < 60 * 60_000) continue;
+    limitHits.push({ tool: TOOL, timestamp: h.ts, ...(h.resetsAt ? { resetsAt: h.resetsAt } : {}) });
+  }
+
   return {
     tool: TOOL,
     events: ctx.events,
     sessions,
     historical,
     sources: roots.map((r) => r.root),
+    limitHits,
+    // Claude's real limits as fetched by the opt-in usage check (clausage's own cache)
+    limits: readClaudeUsageHistory(),
   };
 }
 

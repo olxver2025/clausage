@@ -8,6 +8,7 @@ import { PageHeader, Panel } from "@/components/Panel";
 import { PanelSkeleton } from "@/components/Skeleton";
 import { GroupControl } from "@/components/shell/GroupControl";
 import { getFilters, getUsage, reportFrom, type Filters } from "@/lib/data";
+import { machineGroups, machineLabel } from "@/lib/machines";
 import { describeRange, filtersToQuery } from "@/lib/filters";
 import { formatBucketKey, formatCost, formatDateTime, formatNumber, formatRelative, formatTokens } from "@/lib/format";
 import { fillDailyGaps, stackedSeries } from "@/lib/series";
@@ -48,19 +49,21 @@ async function Content({ searchParams }: { searchParams: PageProps<"/projects">[
   const data = await getUsage(filters);
   const report = reportFrom(data, "projects", filters);
 
+  const groups = machineGroups(data.machines, report.rows.map((r) => r.meta?.machine as string | undefined));
   const lastActive = new Map<string, number>();
   for (const e of data.events) {
-    const k = e.project || "";
+    const k = groups.length ? `${e.project || ""}@${e.machine ?? ""}` : e.project || "";
     if (e.timestamp > (lastActive.get(k) ?? 0)) lastActive.set(k, e.timestamp);
   }
   const now = data.loadedAt;
 
-  const rows: DataRow[] = report.rows.map((row) => {
-    const known = row.key !== "";
-    const name = known ? basename(row.key) : "(unknown)";
+  const toRow = (row: (typeof report.rows)[number]): DataRow => {
+    const path = (row.meta?.project as string | undefined) ?? row.key;
+    const known = path !== "";
+    const name = known ? basename(path) : "(unknown)";
     const last = lastActive.get(row.key);
     const sessions = Number(row.meta?.sessions ?? 0);
-    const selected = filters.project === row.key;
+    const selected = filters.project === path;
     return {
       id: row.key || "__unknown",
       cells: {
@@ -68,7 +71,7 @@ async function Content({ searchParams }: { searchParams: PageProps<"/projects">[
           <span className="flex min-w-0 flex-col gap-0.5">
             {known ? (
               <Link
-                href={projectHref(filters, selected ? undefined : row.key)}
+                href={projectHref(filters, selected ? undefined : path)}
                 aria-current={selected ? "true" : undefined}
                 className="font-medium text-fg underline decoration-line-strong underline-offset-2 hover:decoration-accent aria-[current]:decoration-accent"
               >
@@ -77,7 +80,7 @@ async function Content({ searchParams }: { searchParams: PageProps<"/projects">[
             ) : (
               <span className="font-medium text-fg-2">{name}</span>
             )}
-            {known && <span className="font-mono text-[0.6875rem] break-all text-fg-3">{row.key}</span>}
+            {known && <span className="font-mono text-[0.6875rem] break-all text-fg-3">{path}</span>}
             <span className="md:hidden">
               <ToolChips tools={row.tools} />
             </span>
@@ -97,7 +100,8 @@ async function Content({ searchParams }: { searchParams: PageProps<"/projects">[
       },
       sort: { project: name, sessions, tokens: row.totalTokens, cost: row.costUSD, last: last ?? null },
     };
-  });
+  };
+  const rows: DataRow[] = report.rows.map(toRow);
 
   const t = report.totals;
   const footer = {
@@ -110,6 +114,24 @@ async function Content({ searchParams }: { searchParams: PageProps<"/projects">[
   return (
     <div className="flex flex-col gap-3">
       {filters.project && <ProjectDetail filters={filters} />}
+      {groups.length > 0 ? (
+        groups.map((machine) => {
+          const own = report.rows.filter((r) => (r.meta?.machine ?? "") === machine);
+          const cost = own.reduce((n, r) => n + r.costUSD, 0);
+          return (
+            <Panel key={machine || "__unknown"} title={machineLabel(data.machines, machine)} description={`${formatCost(cost)} across ${plural(own.length, "project")}`}>
+              <DataTable
+                caption={`Usage per project on ${machine || "an unknown computer"}`}
+                columns={columns}
+                rows={own.map(toRow)}
+                defaultSort={{ key: "cost", dir: "desc" }}
+                maxHeight="40rem"
+                emptyMessage="No usage in this range."
+              />
+            </Panel>
+          );
+        })
+      ) : (
       <Panel
         title={filters.project ? "Matching projects" : "All projects"}
         description={`${describeRange(filters)} · ${formatCost(t.costUSD)} across ${plural(report.rows.length, "project")}`}
@@ -124,6 +146,7 @@ async function Content({ searchParams }: { searchParams: PageProps<"/projects">[
           emptyMessage={filters.project ? "No usage for this project in this range." : "No usage in this range."}
         />
       </Panel>
+      )}
     </div>
   );
 }

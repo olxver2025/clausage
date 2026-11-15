@@ -56,7 +56,7 @@ export function useFilters(): { filters: Filters; setFilters: (patch: FilterPatc
   return { filters, setFilters, pending };
 }
 
-export const FILTER_KEYS = ["tools", "range", "since", "until", "tz", "mode", "group", "project", "subagents"] as const;
+export const FILTER_KEYS = ["tools", "range", "since", "until", "tz", "mode", "group", "project", "machines", "subagents"] as const;
 
 /** The current URL's filter params as a query string ('' or '?…'), for links that keep the filters. */
 export function useFilterQuery(): string {
